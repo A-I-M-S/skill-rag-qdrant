@@ -2,8 +2,6 @@
 
 Python system RAG skill with two Telegram bots and Qdrant Cloud.
 
-[![Watch the video](https://img.youtube.com/vi/ib9c2kH0_Pk/0.jpg)](https://www.youtube.com/watch?v=ib9c2kH0_Pk)
-
 ## Architecture
 
 ```mermaid
@@ -69,3 +67,8 @@ Legacy `zo_ask` and generic `openai_compatible` providers are still available by
 ## Logs
 
 All major steps log to `logs/rag-qdrant.log`: Telegram receipt, extraction, chunking, embedding, Qdrant collection creation/upsert/search, prompt inference, and errors.
+
+
+[![Watch the video](https://img.youtube.com/vi/ib9c2kH0_Pk/0.jpg)](https://www.youtube.com/watch?v=ib9c2kH0_Pk)
+
+[![Watch the video](https://img.youtube.com/vi/arghqsaLy8Q/0.jpg)](https://www.youtube.com/watch?v=arghqsaLy8Q)
