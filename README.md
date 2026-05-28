@@ -2,7 +2,7 @@
 
 Python system RAG skill with two Telegram bots and Qdrant Cloud.
 
-[![Watch the video](https://youtube.com)](https://www.youtube.com/watch?v=ib9c2kH0_Pk)
+[![Watch the video](https://img.youtube.com/vi/ib9c2kH0_Pk/0.jpg)](https://www.youtube.com/watch?v=ib9c2kH0_Pk)
 
 ## Architecture
 
