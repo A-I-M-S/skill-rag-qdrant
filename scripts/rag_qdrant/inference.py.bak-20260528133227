@@ -8,14 +8,17 @@ from .config import settings
 from .logging_setup import logger
 from .qdrant_store import search
 
-SYSTEM_PROMPT = """You are a precise RAG assistant. Answer only from the provided context. Do not cite sources, mention source IDs, or include a Sources section. If the provided context does not contain enough relevant information to answer, reply exactly: No relevant information found."""
+SYSTEM_PROMPT = """You are a precise RAG assistant. Answer only from the provided context. If the context is insufficient, say what is missing. Cite sources inline as [source:chunk_index]."""
 
 
 def build_prompt(question: str, contexts: list[dict]) -> str:
     context_blocks = []
     for item in contexts:
+        source = item.get("source", "unknown")
+        chunk_index = item.get("chunk_index", "?")
+        score = item.get("score", 0)
         text = item.get("text", "")
-        context_blocks.append(text)
+        context_blocks.append(f"[source={source} chunk={chunk_index} score={score:.4f}]\n{text}")
     context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context found."
     return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
 
@@ -104,10 +107,6 @@ def _answer_with_openai_compatible(prompt: str) -> str:
 def answer_question(question: str) -> dict:
     settings.require_inference()
     contexts = search(question, top_k=settings.top_k)
-    contexts = [item for item in contexts if float(item.get("score") or 0) >= settings.min_relevance_score]
-    if not contexts:
-        logger.info("inference_no_relevant_context question_chars=%s min_relevance_score=%s", len(question), settings.min_relevance_score)
-        return {"answer": "No relevant information found", "contexts": []}
     prompt = build_prompt(question, contexts)
     provider = settings.inference_provider.lower()
     model_name = settings.openrouter_model if provider == "openrouter" else settings.inference_model

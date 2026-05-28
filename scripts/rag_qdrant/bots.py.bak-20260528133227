@@ -146,7 +146,14 @@ async def answer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"Query failed: {exc}")
         return
 
-    reply = result["answer"]
+    sources = []
+    for context_item in result["contexts"]:
+        source = context_item.get("source", "unknown")
+        chunk_index = context_item.get("chunk_index", "?")
+        score = context_item.get("score", 0)
+        sources.append(f"- {source}:{chunk_index} ({score:.3f})")
+    sources_text = "\n".join(sources) if sources else "No sources found."
+    reply = f"{result['answer']}\n\nSources:\n{sources_text}"
     await update.message.reply_text(reply[:4000])
 
 
