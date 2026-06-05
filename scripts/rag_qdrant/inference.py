@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import requests
 from openai import OpenAI
 
 from .config import settings
@@ -20,75 +18,7 @@ def build_prompt(question: str, contexts: list[dict]) -> str:
     return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
 
 
-def _answer_with_zo_ask(prompt: str) -> str:
-    token = settings.inference_api_key or os.getenv("ZO_CLIENT_IDENTITY_TOKEN", "")
-    response = requests.post(
-        "https://api.zo.computer/zo/ask",
-        headers={
-            "authorization": token,
-            "content-type": "application/json",
-        },
-        json={
-            "input": f"{SYSTEM_PROMPT}\n\n{prompt}",
-            "model_name": settings.inference_model,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("output", "") if isinstance(data, dict) else str(data)
-
-
-def _message_text(message: dict) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        return "".join(parts)
-    return str(message.get("reasoning") or "")
-
-
-def _answer_with_openrouter(prompt: str) -> str:
-    payload = {
-        "model": settings.openrouter_model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": settings.inference_temperature,
-        "stream": False,
-    }
-    if settings.openrouter_provider:
-        payload["provider"] = {
-            "order": [settings.openrouter_provider],
-            "allow_fallbacks": False,
-        }
-
-    response = requests.post(
-        settings.openrouter_url,
-        headers={
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=120,
-    )
-    response.raise_for_status()
-    data = response.json()
-    choices = data.get("choices", []) if isinstance(data, dict) else []
-    if not choices:
-        raise RuntimeError(f"OpenRouter returned no choices: {data}")
-    message = choices[0].get("message", {})
-    return _message_text(message)
-
-
-def _answer_with_openai_compatible(prompt: str) -> str:
+def _answer(prompt: str) -> str:
     client = OpenAI(api_key=settings.inference_api_key, base_url=settings.inference_base_url)
     response = client.chat.completions.create(
         model=settings.inference_model,
@@ -109,22 +39,16 @@ def answer_question(question: str) -> dict:
         logger.info("inference_no_relevant_context question_chars=%s min_relevance_score=%s", len(question), settings.min_relevance_score)
         return {"answer": "No relevant information found", "contexts": []}
     prompt = build_prompt(question, contexts)
-    provider = settings.inference_provider.lower()
-    model_name = settings.openrouter_model if provider == "openrouter" else settings.inference_model
     logger.info(
-        "inference_start provider=%s model=%s question_chars=%s contexts=%s",
-        provider,
-        model_name,
+        "inference_start model=%s question_chars=%s contexts=%s",
+        settings.inference_model,
         len(question),
         len(contexts),
     )
-    if provider == "openrouter":
-        answer = _answer_with_openrouter(prompt)
-    elif provider == "zo_ask":
-        answer = _answer_with_zo_ask(prompt)
-    elif provider == "openai_compatible":
-        answer = _answer_with_openai_compatible(prompt)
-    else:
-        raise RuntimeError("INFERENCE_PROVIDER must be openrouter, zo_ask, or openai_compatible")
-    logger.info("inference_done provider=%s model=%s answer_chars=%s", provider, model_name, len(answer))
+    answer = _answer(prompt)
+    logger.info(
+        "inference_done model=%s answer_chars=%s",
+        settings.inference_model,
+        len(answer),
+    )
     return {"answer": answer, "contexts": contexts}

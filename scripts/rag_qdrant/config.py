@@ -28,6 +28,16 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "" or raw == "0":
+        return None
+    return int(raw)
+
+
 def _float_env(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value == "":
@@ -55,15 +65,11 @@ class Settings:
     chunk_overlap: int = _int_env("CHUNK_OVERLAP", 150)
     top_k: int = _int_env("TOP_K", 6)
     min_relevance_score: float = _float_env("MIN_RELEVANCE_SCORE", 0.78)
-    inference_provider: str = _env("INFERENCE_PROVIDER", "openrouter")
     inference_base_url: str = _env("INFERENCE_BASE_URL").rstrip("/")
     inference_api_key: str = _env("INFERENCE_API_KEY")
     inference_model: str = _env("INFERENCE_MODEL", "")
     inference_temperature: float = _float_env("INFERENCE_TEMPERATURE", 0.2)
-    openrouter_url: str = _env("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
-    openrouter_api_key: str = _env("OPENROUTER_AK")
-    openrouter_model: str = _env("OPENROUTER_MODEL", "z-ai/glm-4.7-flash")
-    openrouter_provider: str = _env("OPENROUTER_PROVIDER", "cloudflare")
+    telegram_owner_id: int | None = None
     seed_allowed_telegram_ids: set[int] = None
     access_file: Path = SKILL_ROOT / os.getenv("ACCESS_FILE", "data/telegram_access.json")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
@@ -73,6 +79,7 @@ class Settings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed_allowed_telegram_ids", _csv_ints_env("TELEGRAM_SEED_ALLOWLIST"))
+        object.__setattr__(self, "telegram_owner_id", _optional_int_env("TELEGRAM_OWNER_ID"))
 
     def require_bot(self) -> None:
         if not self.bot_token:
@@ -89,24 +96,6 @@ class Settings:
             raise RuntimeError(f"Missing required Qdrant setting(s): {', '.join(missing)}")
 
     def require_inference(self) -> None:
-        provider = self.inference_provider.lower()
-        if provider == "openrouter":
-            missing = [name for name, value in {
-                "OPENROUTER_URL": self.openrouter_url,
-                "OPENROUTER_AK": self.openrouter_api_key,
-                "OPENROUTER_MODEL": self.openrouter_model,
-            }.items() if not value]
-            if missing:
-                raise RuntimeError(f"Missing OpenRouter setting(s): {', '.join(missing)}")
-            return
-        if provider == "zo_ask":
-            if not (self.inference_api_key or os.getenv("ZO_CLIENT_IDENTITY_TOKEN")):
-                raise RuntimeError(
-                    "Zo Ask inference requires INFERENCE_API_KEY in .env or ZO_CLIENT_IDENTITY_TOKEN in the process environment."
-                )
-            return
-        if provider != "openai_compatible":
-            raise RuntimeError("INFERENCE_PROVIDER must be openrouter, zo_ask, or openai_compatible")
         missing = [name for name, value in {
             "INFERENCE_BASE_URL": self.inference_base_url,
             "INFERENCE_API_KEY": self.inference_api_key,

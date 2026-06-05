@@ -17,6 +17,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     ensure_collection()
     store = configure_access_store(settings.access_file, seed=settings.seed_allowed_telegram_ids)
     asyncio.run(store.load())
+    if settings.telegram_owner_id is not None:
+        asyncio.run(store.set_owner(settings.telegram_owner_id))
     print(json.dumps(collection_stats(), indent=2))
     print(
         json.dumps(

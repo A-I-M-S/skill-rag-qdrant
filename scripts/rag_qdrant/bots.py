@@ -31,6 +31,8 @@ async def _ensure_owner(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
+    if settings.telegram_owner_id is not None:
+        return False
     store = get_access_store()
     if store.is_owner_set():
         return False

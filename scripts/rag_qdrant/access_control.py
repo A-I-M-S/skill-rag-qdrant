@@ -136,6 +136,22 @@ class AccessStore:
             logger.info("telegram_owner_claimed user_id=%s", self._owner_id)
             return True
 
+    async def set_owner(self, user_id: int) -> bool:
+        async with self._lock:
+            uid = int(user_id)
+            if self._owner_id == uid:
+                return False
+            previous = self._owner_id
+            self._owner_id = uid
+            self._allowed.discard(uid)
+            await self._save_locked()
+            logger.info(
+                "telegram_owner_set user_id=%s previous=%s",
+                self._owner_id,
+                previous,
+            )
+            return True
+
     async def allow(self, user_id: int) -> bool:
         async with self._lock:
             uid = int(user_id)
