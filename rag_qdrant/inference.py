@@ -52,3 +52,6 @@ def answer_question(question: str) -> dict:
         len(answer),
     )
     return {"answer": answer, "contexts": contexts}
+
+
+ask = answer_question

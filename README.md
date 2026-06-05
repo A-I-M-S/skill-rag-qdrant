@@ -1,98 +1,132 @@
-# skill-rag-qdrant
+# rag-qdrant
 
-Python system RAG skill with a single Telegram bot and Qdrant Cloud.
+A local, agent-callable RAG skill. Ingest text, PDF, or Markdown into a Qdrant collection with FastEmbed multilingual E5 embeddings and answer questions with a single OpenAI-compatible chat endpoint.
+
+This skill is consumed two ways:
+
+- **CLI** — `python -m rag_qdrant <subcommand>`
+- **Python API** — `from rag_qdrant import RAG, ingest_text, ask, search, stats, ensure_collection`
+
+No Telegram bot, no extra UI, no provider-dispatch. The inference layer is one OpenAI-compatible chat completion endpoint.
+
+## Quickstart
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env: set QDRANT_URL, QDRANT_API_KEY, INFERENCE_BASE_URL, INFERENCE_API_KEY, INFERENCE_MODEL
+python -m rag_qdrant init
+python -m rag_qdrant ingest-file /path/to/notes.pdf
+python -m rag_qdrant ask "What does the document say about chunking?"
+```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  U[Telegram User] --> B[Telegram Bot: ingest + query]
-  B -- "embed prefix text or caption" --> X[PDF/TXT extraction or plain text]
-  X --> C[Chunk text]
-  C --> D[FastEmbed E5 Small Multilingual]
-  D --> E[Qdrant Cloud]
-  B -- "any other text" --> G[Embed question]
-  G --> H[Vector search Qdrant]
-  H --> I[Build grounded prompt]
-  I --> J[Inference endpoint]
-  J --> K[Telegram answer]
+  CLI[python -m rag_qdrant] --> A[rag_qdrant package]
+  API[openclaw agent import] --> A
+  A --> T[Text extraction<br/>pypdf / read_text]
+  A --> C[Chunk text<br/>CHUNK_SIZE=900, OVERLAP=150]
+  A --> E[FastEmbed<br/>multilingual-e5-small]
+  A --> Q[Qdrant collection<br/>QDRANT_COLLECTION]
+  A --> I[OpenAI-compatible<br/>chat.completions]
+  I --> A
 ```
 
-## Setup
+## CLI
+
+| Subcommand | What it does |
+|---|---|
+| `init` | Create the Qdrant collection and payload indexes if missing |
+| `stats` | Show points count, indexed vector count, collection status |
+| `ingest-file <path> [--source NAME]` | Extract and ingest a PDF/TXT/MD file |
+| `ingest-text <text> [--source NAME]` | Ingest a raw string |
+| `search <question> [--top-k N]` | Raw vector search, returns the top-K contexts as JSON |
+| `ask <question>` | Search + grounded answer through the inference model |
+
+All output is JSON to stdout. Logs go to `logs/rag-qdrant.log` and stderr.
+
+## Python API
+
+Flat functions:
+
+```python
+from rag_qdrant import (
+    ensure_collection, ingest_text, ingest_file,
+    ask, search, stats, settings,
+)
+```
+
+Thin `RAG` class (sugar over the flat functions, with an optional `Settings` override):
+
+```python
+from rag_qdrant import RAG
+rag = RAG()
+rag.ingest_text("The cat sat on the mat.", source="manual-note")
+print(rag.ask("Where did the cat sit?")["answer"])
+```
+
+`RAG(...)` takes an optional `Settings` instance. The module-level `settings` is a frozen dataclass built from `.env` at import time.
+
+## Environment
+
+Required:
+
+- `QDRANT_URL`, `QDRANT_API_KEY` — Qdrant instance (Cloud or self-hosted)
+- `INFERENCE_BASE_URL`, `INFERENCE_API_KEY`, `INFERENCE_MODEL` — any OpenAI-compatible chat endpoint
+
+Optional, with defaults:
+
+- `QDRANT_COLLECTION` (default `system_rag`)
+- `FASTEMBED_MODEL` (default `intfloat/multilingual-e5-small`)
+- `EMBEDDING_DIM` (default `384`, must match the chosen model)
+- `CHUNK_SIZE` (default `900`)
+- `CHUNK_OVERLAP` (default `150`)
+- `TOP_K` (default `6`)
+- `MIN_RELEVANCE_SCORE` (default `0.78`) — contexts below this cosine similarity are dropped before the LLM call
+- `INFERENCE_TEMPERATURE` (default `0.2`)
+- `LOG_LEVEL`, `LOG_FILE`
+
+See `references/setup.md` for full details, including Qdrant Cloud and local Qdrant instructions, FastEmbed model selection notes, and OpenAI-compatible endpoint configuration.
+
+## Examples
+
+- `examples/ingest_cli.md` — worked CLI examples
+- `examples/agent_usage.md` — how an openclaw agent imports and calls the skill
+
+## Logging
+
+All major operations log to `logs/rag-qdrant.log` and stderr with a single shared formatter: model load, chunking, embedding, Qdrant collection creation / upsert / search, prompt inference, and errors. The logger is `skill_rag_qdrant`, configured once at import.
+
+## Layout
+
+```
+rag_qdrant/
+  __init__.py        # public API (RAG, flat functions, settings, __version__)
+  __main__.py        # CLI: init, stats, ingest-file, ingest-text, search, ask
+  config.py          # Settings dataclass, .env loading
+  qdrant_store.py    # collection, indexes, ingest_text, ingest_file, search
+  text_processing.py # extract_text (pdf/txt/md), chunk_text, normalize_text
+  inference.py       # ask() / answer_question() — search + LLM
+  logging_setup.py   # file + stream handler, rotating log file
+references/
+  setup.md
+examples/
+  ingest_cli.md
+  agent_usage.md
+tests/
+  run_tests.py       # self-contained, no pytest
+SKILL.md             # openclaw skill frontmatter
+README.md            # this file
+```
+
+## Tests
 
 ```bash
-cd /home/workspace/Skills/skill-rag-qdrant
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+python3 tests/run_tests.py
 ```
 
-Fill `.env`. Secrets must stay in `.env`; it is git-ignored.
-
-`TELEGRAM_OWNER_ID` (recommended): if set, this Telegram user ID is the authoritative bot owner on every start. It overrides any `owner_id` already in `data/telegram_access.json` and disables the first-claim fallback. Treat `0` or empty as unset.
-
-`TELEGRAM_SEED_ALLOWLIST` is optional and is consumed only once: on first run, when `data/telegram_access.json` does not exist yet. After that, edit the JSON file or use the bot's `/allow` and `/disallow` commands.
-
-## Commands
-
-```bash
-python -m scripts.rag_qdrant init
-python -m scripts.rag_qdrant ingest-file /path/to/file.pdf
-python -m scripts.rag_qdrant ingest-text "Text to index" --source manual
-python -m scripts.rag_qdrant search "question"
-python -m scripts.rag_qdrant ask "question"
-python -m scripts.rag_qdrant stats
-python -m scripts.rag_qdrant run-bot
-```
-
-## Telegram flow
-
-The bot handles both ingestion and querying in a single conversation:
-
-- Prefix any text with `embed ` (case-insensitive) to store it in Qdrant. Example: `embed The cat sat on the mat.`
-- Send a PDF, TXT, or MD document with the caption `embed <optional note>` to store its content.
-- Send any other text to ask a question. The bot searches Qdrant, builds a grounded prompt, calls the configured inference endpoint, and replies with an answer.
-
-## Bot commands
-
-| Command | Who | What it does |
-|---|---|---|
-| `/start` | anyone | Welcome message. |
-| `/help` | anyone | List all commands and usage. |
-| `/whoami` | anyone | Show your Telegram numeric user ID and your role (owner / allowed / unauthorized). |
-| `/allow <user_id>` | owner only | Add a user ID to the embed allowlist. |
-| `/disallow <user_id>` | owner only | Remove a user ID from the embed allowlist. The owner cannot disallow themselves. |
-| `/allowlist` | owner only | Show the current owner and the allowlist. |
-
-## Access control
-
-- **Owner (env-authoritative):** if `TELEGRAM_OWNER_ID` is set in `.env`, that user is the owner on every bot start. The env var overrides any owner already in `data/telegram_access.json` and disables the first-claim fallback.
-- **Owner (first-claim fallback):** if `TELEGRAM_OWNER_ID` is unset and no owner exists in the JSON file, the first Telegram user to ever send a message to the bot is auto-promoted to owner. This is a one-time event. The owner is told on their first reply: "You are now the owner of this bot."
-- **Allowlist:** the owner manages a list of additional Telegram user IDs that are allowed to embed.
-- **Queries:** open to everyone, no gate.
-- **Embeds:** only the owner and allowlisted users can run an `embed ` command.
-- **Persistence:** owner ID and allowlist are stored in `data/telegram_access.json` and survive bot restarts. Writes are atomic (`os.replace` of a temp file). Concurrent updates are serialized with an `asyncio.Lock` inside the bot process.
-- **Seeding:** `TELEGRAM_SEED_ALLOWLIST` is read once, on first run, to bootstrap the allowlist before any message is received. The first user to message the bot afterwards still becomes the owner (unless `TELEGRAM_OWNER_ID` overrides it).
-
-## Inference
-
-A single OpenAI-compatible chat completion endpoint. Configure it in `.env`:
-
-```env
-INFERENCE_BASE_URL=https://your-endpoint/v1
-INFERENCE_API_KEY=...
-INFERENCE_MODEL=your-model
-INFERENCE_TEMPERATURE=0.2
-```
-
-The bot uses `openai` Python client pointed at `INFERENCE_BASE_URL` to call `chat.completions.create` with `INFERENCE_MODEL` and `INFERENCE_TEMPERATURE`. No provider dispatch, no OpenRouter-only fields.
-
-## Logs
-
-All major steps log to `logs/rag-qdrant.log`: Telegram receipt, owner set / claim, allowlist mutation, extraction, chunking, embedding, Qdrant collection creation/upsert/search, prompt inference, and errors.
-
-
-[![Watch the video](https://img.youtube.com/vi/ib9c2kH0_Pk/0.jpg)](https://www.youtube.com/watch?v=ib9c2kH0_Pk)
-
-[![Watch the video](https://img.youtube.com/vi/arghqsaLy8Q/0.jpg)](https://www.youtube.com/watch?v=arghqsaLy8Q)
+The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, and `inference` module shape, and it source-greps the codebase to assert no OpenRouter / Telegram stragglers remain.

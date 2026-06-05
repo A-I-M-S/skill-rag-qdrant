@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-SKILL_ROOT = Path(__file__).resolve().parents[2]
+SKILL_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(SKILL_ROOT / ".env")
 
 ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -28,16 +28,6 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
-def _optional_int_env(name: str) -> int | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if raw == "" or raw == "0":
-        return None
-    return int(raw)
-
-
 def _float_env(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value == "":
@@ -45,17 +35,9 @@ def _float_env(name: str, default: float) -> float:
     return float(value)
 
 
-def _csv_ints_env(name: str) -> set[int]:
-    value = os.getenv(name, "").strip()
-    if not value:
-        return set()
-    return {int(part.strip()) for part in value.split(",") if part.strip()}
-
-
 @dataclass(frozen=True)
 class Settings:
     skill_root: Path = SKILL_ROOT
-    bot_token: str = _env("TELEGRAM_BOT_TOKEN")
     qdrant_url: str = _env("QDRANT_URL")
     qdrant_api_key: str = _env("QDRANT_API_KEY")
     qdrant_collection: str = _env("QDRANT_COLLECTION", "system_rag")
@@ -69,23 +51,8 @@ class Settings:
     inference_api_key: str = _env("INFERENCE_API_KEY")
     inference_model: str = _env("INFERENCE_MODEL", "")
     inference_temperature: float = _float_env("INFERENCE_TEMPERATURE", 0.2)
-    telegram_owner_id: int | None = None
-    seed_allowed_telegram_ids: set[int] = None
-    access_file: Path = SKILL_ROOT / os.getenv("ACCESS_FILE", "data/telegram_access.json")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file: Path = SKILL_ROOT / os.getenv("LOG_FILE", "logs/rag-qdrant.log")
-    upload_dir: Path = SKILL_ROOT / os.getenv("UPLOAD_DIR", "storage/uploads")
-    text_message_dir: Path = SKILL_ROOT / os.getenv("TEXT_MESSAGE_DIR", "storage/text_messages")
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "seed_allowed_telegram_ids", _csv_ints_env("TELEGRAM_SEED_ALLOWLIST"))
-        object.__setattr__(self, "telegram_owner_id", _optional_int_env("TELEGRAM_OWNER_ID"))
-
-    def require_bot(self) -> None:
-        if not self.bot_token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is missing in .env")
-        self.require_qdrant()
-        self.require_inference()
 
     def require_qdrant(self) -> None:
         missing = [name for name, value in {

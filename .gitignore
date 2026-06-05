@@ -7,8 +7,5 @@
 .ruff_cache/
 .venv/
 __pycache__/
-data/
 logs/
 storage/models/
-storage/text_messages/
-storage/uploads/

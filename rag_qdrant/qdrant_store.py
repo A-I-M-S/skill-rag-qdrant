@@ -74,7 +74,6 @@ def ensure_payload_indexes() -> None:
         "source": models.PayloadSchemaType.KEYWORD,
         "file_name": models.PayloadSchemaType.KEYWORD,
         "file_type": models.PayloadSchemaType.KEYWORD,
-        "telegram_user_id": models.PayloadSchemaType.INTEGER,
     }
     for field, schema in field_schemas.items():
         try:

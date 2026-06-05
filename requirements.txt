@@ -2,6 +2,4 @@ fastembed>=0.5.1
 openai>=1.55.3
 pypdf>=5.1.0
 python-dotenv>=1.0.1
-python-telegram-bot>=21.7
 qdrant-client[fastembed]>=1.12.1
-requests>=2.32.3
