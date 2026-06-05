@@ -1,18 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 
-from .bots import run_all_bots, run_ingest_bot, run_query_bot
+from .access_control import configure_access_store
+from .bots import run_bot
 from .inference import answer_question
 from .logging_setup import logger
 from .qdrant_store import collection_stats, ensure_collection, ingest_file, ingest_text, search
+from .config import settings
 
 
 def cmd_init(args: argparse.Namespace) -> None:
     ensure_collection()
+    store = configure_access_store(settings.access_file, seed=settings.seed_allowed_telegram_ids)
+    asyncio.run(store.load())
     print(json.dumps(collection_stats(), indent=2))
+    print(
+        json.dumps(
+            {
+                "access_file": str(store.path),
+                "owner_id": store.owner_id,
+                "allowed_user_ids": store.get_allowed(),
+            },
+            indent=2,
+        )
+    )
 
 
 def cmd_ingest_file(args: argparse.Namespace) -> None:
@@ -43,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m scripts.rag_qdrant")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="Create the Qdrant collection if needed")
+    init = sub.add_parser("init", help="Create the Qdrant collection and bootstrap the access file if needed")
     init.set_defaults(func=cmd_init)
 
     ingest_file_parser = sub.add_parser("ingest-file", help="Ingest a PDF/TXT/MD file")
@@ -68,14 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     stats = sub.add_parser("stats", help="Show Qdrant collection stats")
     stats.set_defaults(func=cmd_stats)
 
-    run_ingest = sub.add_parser("run-ingest-bot", help="Run Telegram ingestion bot A")
-    run_ingest.set_defaults(func=lambda args: run_ingest_bot())
-
-    run_query = sub.add_parser("run-query-bot", help="Run Telegram query bot B")
-    run_query.set_defaults(func=lambda args: run_query_bot())
-
-    run_all = sub.add_parser("run-all", help="Run both Telegram bots in one process")
-    run_all.set_defaults(func=lambda args: run_all_bots())
+    run_bot_parser = sub.add_parser("run-bot", help="Run the unified Telegram bot (ingest + query)")
+    run_bot_parser.set_defaults(func=lambda args: run_bot())
 
     return parser
 

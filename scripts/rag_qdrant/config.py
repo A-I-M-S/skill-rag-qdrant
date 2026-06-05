@@ -45,8 +45,7 @@ def _csv_ints_env(name: str) -> set[int]:
 @dataclass(frozen=True)
 class Settings:
     skill_root: Path = SKILL_ROOT
-    ingest_bot_token: str = _env("TELEGRAM_INGEST_BOT_TOKEN")
-    query_bot_token: str = _env("TELEGRAM_QUERY_BOT_TOKEN")
+    bot_token: str = _env("TELEGRAM_BOT_TOKEN")
     qdrant_url: str = _env("QDRANT_URL")
     qdrant_api_key: str = _env("QDRANT_API_KEY")
     qdrant_collection: str = _env("QDRANT_COLLECTION", "system_rag")
@@ -65,23 +64,19 @@ class Settings:
     openrouter_api_key: str = _env("OPENROUTER_AK")
     openrouter_model: str = _env("OPENROUTER_MODEL", "z-ai/glm-4.7-flash")
     openrouter_provider: str = _env("OPENROUTER_PROVIDER", "cloudflare")
-    allowed_telegram_user_ids: set[int] = None
+    seed_allowed_telegram_ids: set[int] = None
+    access_file: Path = SKILL_ROOT / os.getenv("ACCESS_FILE", "data/telegram_access.json")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file: Path = SKILL_ROOT / os.getenv("LOG_FILE", "logs/rag-qdrant.log")
     upload_dir: Path = SKILL_ROOT / os.getenv("UPLOAD_DIR", "storage/uploads")
     text_message_dir: Path = SKILL_ROOT / os.getenv("TEXT_MESSAGE_DIR", "storage/text_messages")
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "allowed_telegram_user_ids", _csv_ints_env("ALLOWED_TELEGRAM_USER_IDS"))
+        object.__setattr__(self, "seed_allowed_telegram_ids", _csv_ints_env("TELEGRAM_SEED_ALLOWLIST"))
 
-    def require_ingest_bot(self) -> None:
-        if not self.ingest_bot_token:
-            raise RuntimeError("TELEGRAM_INGEST_BOT_TOKEN is missing in .env")
-        self.require_qdrant()
-
-    def require_query_bot(self) -> None:
-        if not self.query_bot_token:
-            raise RuntimeError("TELEGRAM_QUERY_BOT_TOKEN is missing in .env")
+    def require_bot(self) -> None:
+        if not self.bot_token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is missing in .env")
         self.require_qdrant()
         self.require_inference()
 
