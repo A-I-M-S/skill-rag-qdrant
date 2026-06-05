@@ -4,7 +4,7 @@ How an openclaw agent imports the skill and calls it programmatically.
 
 ## Public API surface
 
-The skill re-exports flat functions and a thin `RAG` class from the top-level `rag_qdrant` package:
+The skill re-exports flat functions, a thin `RAG` class, and the agent-mode message handler from the top-level `rag_qdrant` package:
 
 ```python
 from rag_qdrant import (
@@ -12,6 +12,8 @@ from rag_qdrant import (
     ingest_text, ingest_file,     # flat ingest
     ask, search, stats,           # flat query
     ensure_collection,            # idempotent collection + index setup
+    AgentMessage, Attachment,     # agent-mode message types
+    handle_message,               # chat-style dispatcher
     settings, __version__,        # configuration + version
 )
 ```
@@ -140,3 +142,65 @@ Return the raw dicts to the model. The `contexts` list is useful for agentic loo
 - If Qdrant is not configured (`QDRANT_URL` / `QDRANT_API_KEY` missing), any function that touches Qdrant raises `RuntimeError`. The same fix.
 - If the collection does not exist, `ensure_collection()` creates it. The other functions call `ensure_collection()` internally before doing real work, so the very first call after a fresh setup will create the collection lazily.
 - File ingestion of an unsupported suffix (anything other than `.pdf`, `.txt`, `.md`, `.text`) raises `ValueError` with a clear message.
+
+## Agent-mode message handler
+
+The `AgentMessage` / `Attachment` / `handle_message` triple adapts the skill to a chat-style transport. The handler is pure library code: it does not import any chat-transport package, does not perform network I/O, and does not read `.env`. The agent layer is responsible for turning inbound traffic into an `AgentMessage` and for sending the returned string back to the user.
+
+### Rules (case-insensitive prefix match)
+
+| User input | Action | Reply |
+| --- | --- | --- |
+| `Embed <text>` | `ingest_text(text, source="telegram-<sha1(text[:40])[:12]>")` | `Ingested N chunks from telegram-<sha1[:12]>` |
+| `Embed` + attached `.pdf`/`.txt`/`.md`/`.text` file | save to a temp path, `ingest_file(path, source=<filename>)` | `Ingested N chunks from <filename>` |
+| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, source, payload, chunk_index, `contexts` |
+
+The `Embed` text path defaults `source` to `telegram-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp so each ingest still gets a unique source.
+
+`Embed` with no text and no attachment, `Query` with no body, or any message that does not start with `Embed` / `Query` raises `ValueError`. The handler produces no graceful reply for those cases — the agent layer is expected to catch the exception and reply however it likes.
+
+### End-to-end example
+
+```python
+from rag_qdrant import AgentMessage, Attachment, handle_message
+
+# Embed text
+print(handle_message(AgentMessage(text="Embed The cat sat on the mat.")))
+# 'Ingested 1 chunks from telegram-3b4f0e1a9c2d'
+
+# Embed attached file
+with open("notes.pdf", "rb") as f:
+    print(handle_message(
+        AgentMessage(
+            text="Embed",
+            attachment=Attachment("notes.pdf", f.read()),
+        )
+    ))
+# 'Ingested 14 chunks from notes.pdf'
+
+# Query (reply contains ONLY the answer string, no contexts)
+print(handle_message(AgentMessage(text="Query Where did the cat sit?")))
+# 'The cat sat on the mat.'
+```
+
+### Wiring it to a transport (sketch)
+
+```python
+import asyncio
+from rag_qdrant import AgentMessage, Attachment, handle_message
+
+
+def on_user_text(text: str) -> str:
+    try:
+        return handle_message(AgentMessage(text=text))
+    except ValueError as exc:
+        return f"Sorry, I did not understand that. ({exc})"
+
+
+def on_user_file(text: str, filename: str, content: bytes) -> str:
+    return handle_message(
+        AgentMessage(text=text, attachment=Attachment(filename, content))
+    )
+```
+
+The agent / bot framework is responsible for collecting `(text, file_name, file_bytes)` from the transport and calling the helpers above.

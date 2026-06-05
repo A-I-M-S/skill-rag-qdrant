@@ -3,6 +3,7 @@
 Public API:
     - Flat functions: ingest_text, ingest_file, ask, search, stats, ensure_collection
     - Thin RAG class that delegates to the flat functions with a custom Settings
+    - Agent-mode message handler: handle_message, AgentMessage, Attachment
     - settings, __version__
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .agent_handler import AgentMessage, Attachment, handle_message
 from .config import Settings, settings
 from .inference import answer_question, ask, build_prompt
 from .qdrant_store import (
@@ -28,6 +30,8 @@ __version__ = "0.1.0"
 stats = collection_stats
 
 __all__ = [
+    "AgentMessage",
+    "Attachment",
     "RAG",
     "Settings",
     "ask",
@@ -37,6 +41,7 @@ __all__ = [
     "collection_stats",
     "ensure_collection",
     "extract_text",
+    "handle_message",
     "ingest_file",
     "ingest_text",
     "normalize_text",

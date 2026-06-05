@@ -447,6 +447,15 @@ def run_cli_tests() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Agent handler tests (delegated to tests/test_agent_handler.py)
+# ---------------------------------------------------------------------------
+
+def run_agent_handler_tests() -> None:
+    import test_agent_handler  # noqa: E402
+    test_agent_handler.main()
+
+
+# ---------------------------------------------------------------------------
 # Repo-wide grep: no zo / telegram stragglers
 # ---------------------------------------------------------------------------
 
@@ -499,6 +508,8 @@ def main() -> int:
     run_cli_tests()
     print("\n== repo grep tests ==")
     run_repo_grep_tests()
+    print("\n== agent handler tests ==")
+    run_agent_handler_tests()
     print(f"\n{len(passed)} passed, {len(failed)} failed")
     if failed:
         for label, detail in failed:

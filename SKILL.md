@@ -103,8 +103,56 @@ print(rag.ask("summarize the meeting").answer if hasattr(rag.ask, "answer") else
 
 See `examples/agent_usage.md` for a complete openclaw agent pattern.
 
+## Agent message handler
+
+A small pure-library adapter that lets an openclaw agent (or a Telegram bot, webhook, REPL, etc.) treat the skill as a chat-style command surface. The agent layer turns inbound traffic into an `AgentMessage` and sends the returned string back to the user. The handler does **not** import any chat-transport package, does **not** perform network I/O, and does **not** read `.env` / config — it is pure library code that delegates to the existing flat functions.
+
+Public types: `AgentMessage`, `Attachment`, `handle_message`.
+
+Supported commands (case-insensitive prefix match):
+
+| User input | Action | Reply |
+| --- | --- | --- |
+| `Embed <text>` | `ingest_text(text, source="telegram-<sha1(text[:40])[:12]>")` | `Ingested N chunks from telegram-<sha1[:12]>` |
+| `Embed` + attached `.pdf`/`.txt`/`.md`/`.text` file | save to a temp path (cleaned up after the call), `ingest_file(path, source=<filename>)` | `Ingested N chunks from <filename>` |
+| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
+
+Default source naming for `Embed <text>`: `telegram-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp (ISO 8601, seconds) so each ingest still gets a unique source.
+
+Negative paths (these **raise** `ValueError`; the handler produces no graceful reply):
+
+- `Embed` with no text after the prefix **and** no attachment.
+- `Query` with no text after the prefix.
+- Any message that does not start with `Embed` or `Query`.
+
+Example:
+
+```python
+from rag_qdrant import AgentMessage, Attachment, handle_message
+
+# Embed text
+reply = handle_message(AgentMessage(text="Embed The cat sat on the mat."))
+# -> 'Ingested 1 chunks from telegram-3b4f0e1a9c2d'
+
+# Embed attached file
+reply = handle_message(
+    AgentMessage(
+        text="Embed",
+        attachment=Attachment("notes.pdf", open("notes.pdf", "rb").read()),
+    )
+)
+# -> 'Ingested 14 chunks from notes.pdf'
+
+# Query
+reply = handle_message(AgentMessage(text="Query Where did the cat sit?"))
+# -> 'The cat sat on the mat.'   (only the answer, no contexts)
+```
+
+See `examples/agent_usage.md` for the full integration pattern.
+
 ## References
 
 - `references/setup.md` — environment variables, Qdrant Cloud vs. local, FastEmbed model selection, OpenAI-compatible endpoint config
 - `examples/ingest_cli.md` — worked examples of `init`, `ingest-text`, `ingest-file`, `ask`
 - `examples/agent_usage.md` — how an openclaw agent imports and calls the skill programmatically
+- `rag_qdrant/agent_handler.py` — `AgentMessage`, `Attachment`, `handle_message` (the chat-style adapter described above)
