@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from openai import OpenAI
 
+from .cache import (
+    semantic_cache_lookup,
+    semantic_cache_store,
+)
 from .config import settings
 from .logging_setup import logger
-from .qdrant_store import search
+from .qdrant_store import embed_texts, search
 
 SYSTEM_PROMPT = """You are a precise RAG assistant. Answer only from the provided context. Do not cite sources, mention source IDs, or include a Sources section. If the provided context does not contain enough relevant information to answer, reply exactly: No relevant information found."""
+
+NO_RELEVANT_ANSWER = "No relevant information found"
 
 
 def build_prompt(question: str, contexts: list[dict]) -> str:
@@ -33,11 +39,22 @@ def _answer(prompt: str) -> str:
 
 def answer_question(question: str) -> dict:
     settings.require_inference()
-    contexts = search(question, top_k=settings.top_k)
+    if settings.semantic_cache_enabled:
+        query_embedding = embed_texts([question], query=True)[0]
+        cached = semantic_cache_lookup(question, query_embedding)
+        if cached is not None:
+            return cached
+    else:
+        query_embedding = None
+
+    contexts = search(question, top_k=settings.top_k, query_vector=query_embedding)
     contexts = [item for item in contexts if float(item.get("score") or 0) >= settings.min_relevance_score]
     if not contexts:
         logger.info("inference_no_relevant_context question_chars=%s min_relevance_score=%s", len(question), settings.min_relevance_score)
-        return {"answer": "No relevant information found", "contexts": []}
+        result = {"answer": NO_RELEVANT_ANSWER, "contexts": []}
+        if settings.semantic_cache_enabled and query_embedding is not None:
+            semantic_cache_store(question, query_embedding, result, is_miss=True)
+        return result
     prompt = build_prompt(question, contexts)
     logger.info(
         "inference_start model=%s question_chars=%s contexts=%s",
@@ -51,7 +68,10 @@ def answer_question(question: str) -> dict:
         settings.inference_model,
         len(answer),
     )
-    return {"answer": answer, "contexts": contexts}
+    result = {"answer": answer, "contexts": contexts}
+    if settings.semantic_cache_enabled and query_embedding is not None:
+        semantic_cache_store(question, query_embedding, result, is_miss=False)
+    return result
 
 
 ask = answer_question

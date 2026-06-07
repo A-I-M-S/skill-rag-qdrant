@@ -103,6 +103,34 @@ print(rag.ask("summarize the meeting").answer if hasattr(rag.ask, "answer") else
 
 See `examples/agent_usage.md` for a complete openclaw agent pattern.
 
+## Caching (opt-in)
+
+Two opt-in caches, both backed by SQLite in `logs/` and disabled by default. Enable with `SEMANTIC_CACHE_ENABLED=1` and/or `SEARCH_CACHE_ENABLED=1` in `.env`.
+
+- **Semantic cache** — caches LLM answers keyed by question similarity (cosine, default threshold `0.88`). On a hit, both the Qdrant search and the LLM call are skipped. "No relevant information found" answers use a separate, shorter TTL (`SEMANTIC_CACHE_MISS_TTL_SECONDS`, default 1h).
+- **Search cache** — caches raw Qdrant contexts keyed by exact question hash. On a hit, the Qdrant round-trip is skipped. Invalidated on every successful `ingest-text` / `ingest-file`.
+
+Inspect and manage via the CLI:
+
+```bash
+python -m rag_qdrant cache-info          # show effective config
+python -m rag_qdrant cache-stats         # entries / hits / misses / evictions
+python -m rag_qdrant cache-clear         # clear both (default)
+python -m rag_qdrant cache-clear --target semantic
+python -m rag_qdrant cache-clear --target search
+```
+
+Or programmatically:
+
+```python
+from rag_qdrant import (
+    semantic_cache_stats, semantic_cache_clear,
+    search_cache_stats, search_cache_clear,
+)
+```
+
+The semantic cache is **not** invalidated on ingest by design (clearing on every ingest would defeat the cache in any non-static corpus). All cache wrappers catch `sqlite3.OperationalError` and fall through to the non-cached path; the cache never raises.
+
 ## Agent message handler
 
 A small pure-library adapter that lets an openclaw agent (or a Telegram bot, webhook, REPL, etc.) treat the skill as a chat-style command surface. The agent layer turns inbound traffic into an `AgentMessage` and sends the returned string back to the user. The handler does **not** import any chat-transport package, does **not** perform network I/O, and does **not** read `.env` / config — it is pure library code that delegates to the existing flat functions.
@@ -115,7 +143,7 @@ Supported commands (case-insensitive prefix match):
 | --- | --- | --- |
 | `Embed <text>` | `ingest_text(text, source="telegram-<sha1(text[:40])[:12]>")` | `Ingested N chunks from telegram-<sha1[:12]>` |
 | `Embed` + attached `.pdf`/`.txt`/`.md`/`.text` file | save to a temp path (cleaned up after the call), `ingest_file(path, source=<filename>)` | `Ingested N chunks from <filename>` |
-| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
+| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list. When `SEMANTIC_CACHE_ENABLED=1`, the answer may come from the cache; the contract (only the answer string) is unchanged. |
 
 Default source naming for `Embed <text>`: `telegram-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp (ISO 8601, seconds) so each ingest still gets a unique source.
 
@@ -156,3 +184,4 @@ See `examples/agent_usage.md` for the full integration pattern.
 - `examples/ingest_cli.md` — worked examples of `init`, `ingest-text`, `ingest-file`, `ask`
 - `examples/agent_usage.md` — how an openclaw agent imports and calls the skill programmatically
 - `rag_qdrant/agent_handler.py` — `AgentMessage`, `Attachment`, `handle_message` (the chat-style adapter described above)
+- `rag_qdrant/cache.py` — `SemanticCache` + `SearchCache` (the caching layer described above)

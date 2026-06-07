@@ -29,7 +29,10 @@ Rules (executed in order):
 3. ``message.text`` starts with "Query" (case-insensitive) and has
    non-empty body text -> call :func:`rag_qdrant.ask` and return
    **only** ``result["answer"]``. Score, source, chunk_index, payload,
-   and the contexts list are deliberately dropped.
+   and the contexts list are deliberately dropped. When the semantic
+   cache is enabled (``SEMANTIC_CACHE_ENABLED=1``), the answer may
+   come from the cache; the contract (only the answer string) is
+   unchanged.
 
 4. "Embed" with no text and no attachment, or "Query" with no body,
    raises :class:`ValueError`. The handler does not produce a graceful

@@ -35,6 +35,16 @@ def _float_env(name: str, default: float) -> float:
     return float(value)
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in _TRUTHY
+
+
 @dataclass(frozen=True)
 class Settings:
     skill_root: Path = SKILL_ROOT
@@ -53,6 +63,19 @@ class Settings:
     inference_temperature: float = _float_env("INFERENCE_TEMPERATURE", 0.2)
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file: Path = SKILL_ROOT / os.getenv("LOG_FILE", "logs/rag-qdrant.log")
+
+    semantic_cache_enabled: bool = _bool_env("SEMANTIC_CACHE_ENABLED", False)
+    semantic_cache_path: Path = SKILL_ROOT / os.getenv("SEMANTIC_CACHE_PATH", "logs/semantic_cache.sqlite")
+    semantic_cache_ttl_seconds: int = _int_env("SEMANTIC_CACHE_TTL_SECONDS", 86400)
+    semantic_cache_miss_ttl_seconds: int = _int_env("SEMANTIC_CACHE_MISS_TTL_SECONDS", 3600)
+    semantic_cache_max_entries: int = _int_env("SEMANTIC_CACHE_MAX_ENTRIES", 1000)
+    semantic_cache_similarity_threshold: float = _float_env("SEMANTIC_CACHE_SIMILARITY_THRESHOLD", 0.88)
+    semantic_cache_cache_misses: bool = _bool_env("SEMANTIC_CACHE_CACHE_MISSES", True)
+
+    search_cache_enabled: bool = _bool_env("SEARCH_CACHE_ENABLED", False)
+    search_cache_path: Path = SKILL_ROOT / os.getenv("SEARCH_CACHE_PATH", "logs/search_cache.sqlite")
+    search_cache_ttl_seconds: int = _int_env("SEARCH_CACHE_TTL_SECONDS", 86400)
+    search_cache_max_entries: int = _int_env("SEARCH_CACHE_MAX_ENTRIES", 5000)
 
     def require_qdrant(self) -> None:
         missing = [name for name, value in {

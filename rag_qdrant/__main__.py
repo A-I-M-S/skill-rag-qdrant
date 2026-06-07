@@ -6,6 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
+from .cache import (
+    search_cache_clear,
+    search_cache_stats,
+    semantic_cache_clear,
+    semantic_cache_stats,
+)
+from .config import settings
 from .inference import answer_question
 from .logging_setup import logger
 from .qdrant_store import collection_stats, ensure_collection, ingest_file, ingest_text, search
@@ -40,6 +47,46 @@ def cmd_stats(_args: argparse.Namespace) -> None:
     print(json.dumps(collection_stats(), indent=2))
 
 
+def cmd_cache_stats(_args: argparse.Namespace) -> None:
+    payload = {
+        "semantic": semantic_cache_stats(),
+        "search": search_cache_stats(),
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_cache_clear(args: argparse.Namespace) -> None:
+    target = args.target
+    semantic_cleared = 0
+    search_cleared = 0
+    if target in {"semantic", "all"}:
+        semantic_cleared = semantic_cache_clear()
+    if target in {"search", "all"}:
+        search_cleared = search_cache_clear()
+    print(json.dumps({"target": target, "semantic_cleared": semantic_cleared, "search_cleared": search_cleared}, indent=2))
+
+
+def cmd_cache_info(_args: argparse.Namespace) -> None:
+    payload = {
+        "semantic": {
+            "enabled": settings.semantic_cache_enabled,
+            "path": str(settings.semantic_cache_path),
+            "ttl_seconds": settings.semantic_cache_ttl_seconds,
+            "miss_ttl_seconds": settings.semantic_cache_miss_ttl_seconds,
+            "max_entries": settings.semantic_cache_max_entries,
+            "similarity_threshold": settings.semantic_cache_similarity_threshold,
+            "cache_misses": settings.semantic_cache_cache_misses,
+        },
+        "search": {
+            "enabled": settings.search_cache_enabled,
+            "path": str(settings.search_cache_path),
+            "ttl_seconds": settings.search_cache_ttl_seconds,
+            "max_entries": settings.search_cache_max_entries,
+        },
+    }
+    print(json.dumps(payload, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m rag_qdrant", description="rag-qdrant CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -68,6 +115,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_p = sub.add_parser("stats", help="Show Qdrant collection stats")
     stats_p.set_defaults(func=cmd_stats)
+
+    cache_stats_p = sub.add_parser("cache-stats", help="Show semantic and search cache stats")
+    cache_stats_p.set_defaults(func=cmd_cache_stats)
+
+    cache_clear_p = sub.add_parser("cache-clear", help="Clear one or both caches")
+    cache_clear_p.add_argument("--target", choices=["semantic", "search", "all"], default="all")
+    cache_clear_p.set_defaults(func=cmd_cache_clear)
+
+    cache_info_p = sub.add_parser("cache-info", help="Show effective cache configuration (paths, TTLs, caps)")
+    cache_info_p.set_defaults(func=cmd_cache_info)
 
     return parser
 
