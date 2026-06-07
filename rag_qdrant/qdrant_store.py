@@ -13,6 +13,7 @@ from qdrant_client.http import models
 from .config import settings
 from .logging_setup import logger
 from .text_processing import chunk_text, extract_text, normalize_text
+from .cache import search_cache_invalidate, search_cache_lookup, search_cache_store
 
 _embedding_model: TextEmbedding | None = None
 _client: QdrantClient | None = None
@@ -138,6 +139,7 @@ def ingest_text(text: str, *, source: str, metadata: dict[str, Any] | None = Non
         )
 
     get_qdrant_client().upsert(collection_name=settings.qdrant_collection, points=points, wait=True)
+    search_cache_invalidate()
     logger.info("ingest_text_done source=%s chunks=%s", source, len(points))
     return len(points)
 
@@ -152,10 +154,16 @@ def ingest_file(path: Path, *, source: str | None = None, metadata: dict[str, An
     return count
 
 
-def search(question: str, *, top_k: int | None = None) -> list[dict[str, Any]]:
+def search(question: str, *, top_k: int | None = None, query_vector: list[float] | None = None) -> list[dict[str, Any]]:
     ensure_collection()
     top_k = top_k or settings.top_k
-    query_vector = embed_texts([question], query=True)[0]
+    if settings.search_cache_enabled:
+        cached = search_cache_lookup(question, top_k=top_k)
+        if cached is not None:
+            logger.info("search_done question_chars=%s top_k=%s results=%s source=cache", len(question), top_k, len(cached))
+            return cached
+    if query_vector is None:
+        query_vector = embed_texts([question], query=True)[0]
     client = get_qdrant_client()
     if hasattr(client, "query_points"):
         response = client.query_points(
@@ -184,6 +192,8 @@ def search(question: str, *, top_k: int | None = None) -> list[dict[str, Any]]:
         for hit in hits
     ]
     logger.info("search_done question_chars=%s top_k=%s results=%s", len(question), top_k, len(formatted))
+    if settings.search_cache_enabled:
+        search_cache_store(question, formatted, top_k=top_k)
     return formatted
 
 

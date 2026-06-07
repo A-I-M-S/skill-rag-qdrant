@@ -47,6 +47,9 @@ flowchart LR
 | `ingest-text <text> [--source NAME]` | Ingest a raw string |
 | `search <question> [--top-k N]` | Raw vector search, returns the top-K contexts as JSON |
 | `ask <question>` | Search + grounded answer through the inference model |
+| `cache-stats` | Show entries, hits, misses, evictions for both caches |
+| `cache-clear [--target {semantic\|search\|all}]` | Drop rows from one or both caches (default `all`) |
+| `cache-info` | Show effective cache configuration (paths, TTLs, caps, threshold) |
 
 All output is JSON to stdout. Logs go to `logs/rag-qdrant.log` and stderr.
 
@@ -123,12 +126,74 @@ Optional, with defaults:
 - `INFERENCE_TEMPERATURE` (default `0.2`)
 - `LOG_LEVEL`, `LOG_FILE`
 
+Caching (opt-in, both disabled by default — see [Caching](#caching) below):
+
+- `SEMANTIC_CACHE_ENABLED` (default `0`) — cache LLM answers keyed by question similarity
+- `SEMANTIC_CACHE_PATH` (default `logs/semantic_cache.sqlite`)
+- `SEMANTIC_CACHE_TTL_SECONDS` (default `86400`) — TTL for hit answers
+- `SEMANTIC_CACHE_MISS_TTL_SECONDS` (default `3600`) — shorter TTL for "No relevant information found"
+- `SEMANTIC_CACHE_MAX_ENTRIES` (default `1000`)
+- `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` (default `0.88`) — cosine threshold for a hit
+- `SEMANTIC_CACHE_CACHE_MISSES` (default `1`) — set to `0` to skip caching miss answers
+- `SEARCH_CACHE_ENABLED` (default `0`) — cache raw Qdrant search results keyed by exact question hash
+- `SEARCH_CACHE_PATH` (default `logs/search_cache.sqlite`)
+- `SEARCH_CACHE_TTL_SECONDS` (default `86400`)
+- `SEARCH_CACHE_MAX_ENTRIES` (default `5000`)
+
 See `references/setup.md` for full details, including Qdrant Cloud and local Qdrant instructions, FastEmbed model selection notes, and OpenAI-compatible endpoint configuration.
 
 ## Examples
 
 - `examples/ingest_cli.md` — worked CLI examples
 - `examples/agent_usage.md` — how an openclaw agent imports and calls the skill, including the agent-mode message handler pattern
+
+## Caching
+
+Two opt-in caches, both backed by SQLite files in `logs/` by default and disabled until you flip the corresponding `*_ENABLED=1` env var. Storage uses the stdlib `sqlite3`; no new dependencies. When disabled, the wrappers short-circuit to a single boolean check and never touch SQLite.
+
+### Semantic cache (LLM answers, keyed by question similarity)
+
+When `SEMANTIC_CACHE_ENABLED=1`, `ask()` first embeds the question and scans the semantic cache for any stored question with cosine similarity above `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` (default `0.88`). A hit returns the stored answer and contexts directly, skipping both the Qdrant search and the LLM call. A miss runs the normal pipeline and stores the result.
+
+- **Hits / misses** log at INFO / DEBUG respectively.
+- **TTL** for hit answers defaults to 24h. `"No relevant information found"` answers use a separate, shorter TTL (`SEMANTIC_CACHE_MISS_TTL_SECONDS`, default 1h) so an empty corpus doesn't pin a stale miss forever. Set `SEMANTIC_CACHE_CACHE_MISSES=0` to skip caching miss answers entirely.
+- **Cap** is `SEMANTIC_CACHE_MAX_ENTRIES` (default 1000). Lazy LRU eviction drops the oldest `max_entries // 10` rows on each insert above the cap. Cheap because the lookup is a pure-Python scan (no separate vector index).
+- **Ingest does not invalidate the semantic cache** by design. Cached answers may become slightly stale after new content is added; the next miss-after-TTL picks up the new content. Trade-off: clearing on every ingest would defeat the cache in any non-static corpus.
+
+### Search cache (Qdrant contexts, keyed by exact question hash)
+
+When `SEARCH_CACHE_ENABLED=1`, `search()` checks an in-process LRU (64 entries, hard-coded) and then an on-disk SQLite file keyed by `sha256(collection|fastembed_model|top_k|normalized_question)`. A hit returns the stored contexts without hitting Qdrant. A miss runs the normal `query_points`/`search` call and stores the result.
+
+- **Invalidation**: every successful `ingest_text` / `ingest_file` wipes the search cache (and clears the in-process LRU). The stored contexts are no longer authoritative.
+- **TTL** defaults to 24h. Cap defaults to 5000 rows.
+
+### Programmatic access
+
+```python
+from rag_qdrant import (
+    semantic_cache_stats, semantic_cache_clear,
+    search_cache_stats, search_cache_clear,
+)
+
+print(semantic_cache_stats())  # {'enabled': True, 'entries': 12, 'hits': 47, ...}
+semantic_cache_clear()        # returns rows deleted
+```
+
+`RAG` exposes the same four methods: `rag.semantic_cache_stats()`, `rag.semantic_cache_clear()`, `rag.search_cache_stats()`, `rag.search_cache_clear()`.
+
+### CLI
+
+```bash
+python -m rag_qdrant cache-info          # show effective config
+python -m rag_qdrant cache-stats         # entries / hits / misses / evictions
+python -m rag_qdrant cache-clear         # default: clear both
+python -m rag_qdrant cache-clear --target semantic
+python -m rag_qdrant cache-clear --target search
+```
+
+### Concurrency and failure modes
+
+All cache wrappers catch `sqlite3.OperationalError` (locked DB, disk full, etc.) and fall through to the non-cached path with a warning log. The cache never raises.
 
 ## Logging
 
@@ -139,11 +204,12 @@ All major operations log to `logs/rag-qdrant.log` and stderr with a single share
 ```
 rag_qdrant/
   __init__.py        # public API (RAG, flat functions, settings, agent handler, __version__)
-  __main__.py        # CLI: init, stats, ingest-file, ingest-text, search, ask
+  __main__.py        # CLI: init, stats, ingest-file, ingest-text, search, ask, cache-*
   config.py          # Settings dataclass, .env loading
   qdrant_store.py    # collection, indexes, ingest_text, ingest_file, search
   text_processing.py # extract_text (pdf/txt/md), chunk_text, normalize_text
   inference.py       # ask() / answer_question() — search + LLM
+  cache.py           # SemanticCache + SearchCache (opt-in, SQLite-backed)
   agent_handler.py   # AgentMessage, Attachment, handle_message (chat-style adapter)
   logging_setup.py   # file + stream handler, rotating log file
 references/
@@ -164,4 +230,4 @@ README.md                 # this file
 python3 tests/run_tests.py
 ```
 
-The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`) via source-grep + behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.
+The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the cache layer (round-trip, TTL expiry, max-entries eviction, miss flag, ingest invalidation, inference-bypass-when-disabled, inference-cache-hit-when-enabled), the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`) via source-grep + behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.

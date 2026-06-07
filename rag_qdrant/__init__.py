@@ -2,6 +2,8 @@
 
 Public API:
     - Flat functions: ingest_text, ingest_file, ask, search, stats, ensure_collection
+    - Cache helpers: semantic_cache_stats, semantic_cache_clear,
+      search_cache_stats, search_cache_clear
     - Thin RAG class that delegates to the flat functions with a custom Settings
     - Agent-mode message handler: handle_message, AgentMessage, Attachment
     - settings, __version__
@@ -13,6 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .agent_handler import AgentMessage, Attachment, handle_message
+from .cache import (
+    search_cache_clear,
+    search_cache_stats,
+    semantic_cache_clear,
+    semantic_cache_stats,
+)
 from .config import Settings, settings
 from .inference import answer_question, ask, build_prompt
 from .qdrant_store import (
@@ -46,6 +54,10 @@ __all__ = [
     "ingest_text",
     "normalize_text",
     "search",
+    "search_cache_clear",
+    "search_cache_stats",
+    "semantic_cache_clear",
+    "semantic_cache_stats",
     "settings",
     "stats",
     "__version__",
@@ -87,3 +99,15 @@ class RAG:
 
     def stats(self) -> dict[str, Any]:
         return stats()
+
+    def semantic_cache_stats(self) -> dict[str, Any]:
+        return semantic_cache_stats()
+
+    def semantic_cache_clear(self) -> int:
+        return semantic_cache_clear()
+
+    def search_cache_stats(self) -> dict[str, Any]:
+        return search_cache_stats()
+
+    def search_cache_clear(self) -> int:
+        return search_cache_clear()

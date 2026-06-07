@@ -290,6 +290,29 @@ def run_behavioral_tests() -> None:
         reply = handle_message(AgentMessage(text='  QUERY hi'))
     expect('behavior_rule3_case_insensitive', m_ask.called and reply == 'A')
 
+    # Rule 3 with cache: handler returns ONLY the answer, even when
+    # the answer comes from the cache. We patch `ask` to return a
+    # result that the handler treats as a cache hit, then verify the
+    # contract is preserved (no leaked metadata, no contexts).
+    cached_result = {
+        'answer': 'cached answer only',
+        'contexts': [
+            {
+                'score': 0.95,
+                'source': 'leaky-source',
+                'chunk_index': 7,
+                'text': 'should-not-appear',
+                'payload': {'leak': 'do-not-leak'},
+            }
+        ],
+    }
+    with patch.object(handler_module, 'ask', return_value=cached_result) as m_ask:
+        reply = handle_message(AgentMessage(text='Query anything'))
+    expect('behavior_rule3_cache_path_called_ask', m_ask.called)
+    expect('behavior_rule3_cache_path_answer_only', reply == 'cached answer only')
+    for forbidden in ('score', 'source', 'chunk_index', 'payload', 'contexts', 'leaky-source', 'do-not-leak', 'should-not-appear'):
+        expect(f'behavior_rule3_cache_path_no_{forbidden}', forbidden not in reply)
+
     # Negative: Embed with no text and no attachment -> ValueError
     try:
         handle_message(AgentMessage(text='Embed', attachment=None))
