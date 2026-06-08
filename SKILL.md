@@ -133,47 +133,90 @@ The semantic cache is **not** invalidated on ingest by design (clearing on every
 
 ## Agent message handler
 
-A small pure-library adapter that lets an openclaw agent (or a Telegram bot, webhook, REPL, etc.) treat the skill as a chat-style command surface. The agent layer turns inbound traffic into an `AgentMessage` and sends the returned string back to the user. The handler does **not** import any chat-transport package, does **not** perform network I/O, and does **not** read `.env` / config — it is pure library code that delegates to the existing flat functions.
+A small pure-library adapter that lets an openclaw agent (or a Telegram bot, webhook, REPL, etc.) treat the skill as a chat-style surface. The agent layer turns inbound traffic into an `AgentMessage` and sends the returned string back to the user. The handler does **not** import any chat-transport package and does **not** read `.env` / config — it is pure library code that delegates to the existing flat functions.
 
-Public types: `AgentMessage`, `Attachment`, `handle_message`.
+Public types: `AgentMessage`, `Attachment`, `handle_message`. There are no command prefixes, no `/raw` escape hatches, and no override switches. The configured inference model is the sole decision-maker.
 
-Supported commands (case-insensitive prefix match):
+### What the LLM sees
 
-| User input | Action | Reply |
+Every inbound `AgentMessage` (text or attachment) is sent to the inference model with this system prompt (excerpt — full text in `rag_qdrant/prompts.py`):
+
+> You are the routing layer for a small RAG skill. You have two tools and one chat path. You are the only decision-maker.
+>
+> 1. `store_text(text, source="")` — save `text` into the knowledge base.
+> 2. `ask_corpus(question)` — search the knowledge base and answer `question` grounded in what is found.
+>
+> Chat path (no tool call): greetings, meta-questions, small talk, and clarifications. If intent is ambiguous, prefer a one-line clarification question over a forced tool call.
+>
+> When you call `ask_corpus`, your visible reply must be the grounded answer only — no `contexts`, scores, sources, chunk indices, or payloads. The system drops those automatically.
+
+The two tool schemas (OpenAI-format):
+
+```python
+{
+  "name": "store_text",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text":    {"type": "string"},
+      "source":  {"type": "string", "default": ""}
+    },
+    "required": ["text"]
+  }
+}
+{
+  "name": "ask_corpus",
+  "parameters": {
+    "type": "object",
+    "properties": {"question": {"type": "string"}},
+    "required": ["question"]
+  }
+}
+```
+
+### What the user sees
+
+| LLM decision | Handler action | Reply to the user |
 | --- | --- | --- |
-| `Embed <text>` | `ingest_text(text, source="telegram-<sha1(text[:40])[:12]>")` | `Ingested N chunks from telegram-<sha1[:12]>` |
-| `Embed` + attached `.pdf`/`.txt`/`.md`/`.text` file | save to a temp path (cleaned up after the call), `ingest_file(path, source=<filename>)` | `Ingested N chunks from <filename>` |
-| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list. When `SEMANTIC_CACHE_ENABLED=1`, the answer may come from the cache; the contract (only the answer string) is unchanged. |
+| `store_text(text)` | `ingest_text(text, source="auto-<sha1(text[:40])[:12]>")` (or the explicit `source` the LLM passed) | `Ingested N chunks from <source>` |
+| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
+| No tool call (plain chat) | pass through | the LLM's reply, verbatim |
 
-Default source naming for `Embed <text>`: `telegram-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp (ISO 8601, seconds) so each ingest still gets a unique source.
+If the configured inference endpoint does not support tool calls (or any other API error happens), the wrapper returns a clear error string and the handler returns that string. The handler itself does not raise for routing failures.
 
-Negative paths (these **raise** `ValueError`; the handler produces no graceful reply):
+### Clarification behavior
 
-- `Embed` with no text after the prefix **and** no attachment.
-- `Query` with no text after the prefix.
-- Any message that does not start with `Embed` or `Query`.
+The handler is **stateless**. The original message is dropped after classification; the next inbound message is classified fresh. There are no per-chat pending slots, no session memory, and no follow-up prompt. If the LLM replies with a short clarification question (no tool call), the handler returns that string — that's the entire interaction. The user simply answers, and the next message is classified independently.
 
-Example:
+### Attachments
+
+If `message.attachment` is present and the suffix is `.pdf` / `.txt` / `.md` / `.text`, the handler ingests the file unconditionally **before** the LLM step and builds an `Ingested N chunks from <filename>` notice. The LLM cannot veto an attachment; once sent, it's stored. The notice is prepended to the LLM's view of the user message, so the LLM knows the file is already in the corpus and can call `ask_corpus` if the caption is a question about it. An unsupported attachment suffix (anything other than `.pdf` / `.txt` / `.md` / `.text`) raises `ValueError`.
+
+### Example
 
 ```python
 from rag_qdrant import AgentMessage, Attachment, handle_message
 
-# Embed text
-reply = handle_message(AgentMessage(text="Embed The cat sat on the mat."))
-# -> 'Ingested 1 chunks from telegram-3b4f0e1a9c2d'
+# Text: LLM routes to store_text
+reply = handle_message(AgentMessage(text="The cat sat on the mat."))
+# -> 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
 
-# Embed attached file
+# Text: LLM routes to ask_corpus
+reply = handle_message(AgentMessage(text="Where did the cat sit?"))
+# -> 'The cat sat on the mat.'   (only the answer, no contexts)
+
+# Text: LLM replies with a clarification question
+reply = handle_message(AgentMessage(text="the cat thing"))
+# -> 'Do you want me to save that, or search the corpus for cat notes?'
+
+# Attached file (auto-store, then LLM gets the notice + caption)
 reply = handle_message(
     AgentMessage(
-        text="Embed",
+        text="summarize this",
         attachment=Attachment("notes.pdf", open("notes.pdf", "rb").read()),
     )
 )
-# -> 'Ingested 14 chunks from notes.pdf'
-
-# Query
-reply = handle_message(AgentMessage(text="Query Where did the cat sit?"))
-# -> 'The cat sat on the mat.'   (only the answer, no contexts)
+# -> '<grounded summary>'  (only the answer)
 ```
 
 See `examples/agent_usage.md` for the full integration pattern.
