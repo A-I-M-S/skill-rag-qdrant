@@ -42,7 +42,7 @@ for _missing, _attrs in (
     ("dotenv", ("load_dotenv",)),
     ("fastembed", ()),
     ("fastembed.common.model_description", ("ModelSource", "PoolingType")),
-    ("openai", ("OpenAI",)),
+    ("openai", ("OpenAI", "APIError", "BadRequestError")),
     ("pypdf", ("PdfReader",)),
     ("qdrant_client", ("QdrantClient",)),
     ("qdrant_client.http", ()),
@@ -51,7 +51,12 @@ for _missing, _attrs in (
     _ensure_stub(_missing)
     for _attr in _attrs:
         if not hasattr(sys.modules[_missing], _attr):
-            setattr(sys.modules[_missing], _attr, lambda *a, **k: None)
+            if _attr in ("APIError", "BadRequestError"):
+                # Real exception subclasses so the agent handler's
+                # `classify_and_route` can import them under the stubs.
+                setattr(sys.modules[_missing], _attr, type(_attr, (Exception,), {}))
+            else:
+                setattr(sys.modules[_missing], _attr, lambda *a, **k: None)
 # Provide enums / classes used at import time
 sys.modules["qdrant_client.http.models"].PayloadSchemaType = types.SimpleNamespace(KEYWORD="keyword", INTEGER="integer")
 sys.modules["qdrant_client.http.models"].VectorParams = lambda **kw: ("VectorParams", kw)

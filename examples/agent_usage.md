@@ -145,56 +145,68 @@ Return the raw dicts to the model. The `contexts` list is useful for agentic loo
 
 ## Agent-mode message handler
 
-The `AgentMessage` / `Attachment` / `handle_message` triple adapts the skill to a chat-style transport. The handler is pure library code: it does not import any chat-transport package, does not perform network I/O, and does not read `.env`. The agent layer is responsible for turning inbound traffic into an `AgentMessage` and for sending the returned string back to the user.
+The `AgentMessage` / `Attachment` / `handle_message` triple adapts the skill to a chat-style transport. The handler is pure library code: it does not import any chat-transport package, does not perform network I/O of its own, and does not read `.env`. The agent layer is responsible for turning inbound traffic into an `AgentMessage` and for sending the returned string back to the user.
 
-### Rules (case-insensitive prefix match)
+### How routing works
 
-| User input | Action | Reply |
+The configured inference model is the **sole** decision-maker. There are no command prefixes, no `/raw` escape hatches, and no override switches — the user does not have to phrase their request in any particular way. Every inbound turn is sent to the LLM with the system prompt and two tools (`store_text` and `ask_corpus`, see `rag_qdrant/prompts.py`); the LLM picks exactly one action or replies directly.
+
+The handler's three reply shapes:
+
+| LLM decision | Handler action | Reply to the user |
 | --- | --- | --- |
-| `Embed <text>` | `ingest_text(text, source="telegram-<sha1(text[:40])[:12]>")` | `Ingested N chunks from telegram-<sha1[:12]>` |
-| `Embed` + attached `.pdf`/`.txt`/`.md`/`.text` file | save to a temp path, `ingest_file(path, source=<filename>)` | `Ingested N chunks from <filename>` |
-| `Query <question>` | `ask(question)` | ONLY `result["answer"]` — no score, source, payload, chunk_index, `contexts` |
+| `store_text(text)` (with optional `source`) | `ingest_text(text, source="auto-<sha1(text[:40])[:12]>")` (or the explicit `source` the LLM passed) | `Ingested N chunks from <source>` |
+| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
+| No tool call (greeting, meta-question, clarification) | pass through | the LLM's reply, verbatim |
 
-The `Embed` text path defaults `source` to `telegram-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp so each ingest still gets a unique source.
+Default source naming for `store_text`: `auto-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp so each ingest still gets a unique source.
 
-`Embed` with no text and no attachment, `Query` with no body, or any message that does not start with `Embed` / `Query` raises `ValueError`. The handler produces no graceful reply for those cases — the agent layer is expected to catch the exception and reply however it likes.
+### Clarification behavior
 
-### End-to-end example
+The handler is **stateless**. The original message is dropped after classification; the next inbound message is classified fresh. There are no per-chat pending slots, no session memory, and no follow-up prompt. If the LLM replies with a short clarification question instead of a tool call (e.g. "Do you want me to save that, or search the corpus?"), the handler returns that string and that's the entire interaction. The user simply answers in a new turn.
+
+### Attachments
+
+If the inbound `AgentMessage` has a supported attachment (`.pdf` / `.txt` / `.md` / `.text`), the handler ingests the file unconditionally **before** the LLM step and builds an `Ingested N chunks from <filename>` notice. The LLM cannot veto an attachment — once sent, it's stored. The notice is prepended to the LLM's view of the user message, so the LLM knows the file is already in the corpus and can call `ask_corpus` if the caption is a question about it. An unsupported attachment suffix raises `ValueError` (the only `ValueError` left in the handler).
+
+### End-to-end examples
 
 ```python
 from rag_qdrant import AgentMessage, Attachment, handle_message
 
-# Embed text
-print(handle_message(AgentMessage(text="Embed The cat sat on the mat.")))
-# 'Ingested 1 chunks from telegram-3b4f0e1a9c2d'
+# Text: LLM routes to store_text
+print(handle_message(AgentMessage(text="The cat sat on the mat.")))
+# 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
 
-# Embed attached file
+# Text: LLM routes to ask_corpus (reply is ONLY the answer string)
+print(handle_message(AgentMessage(text="Where did the cat sit?")))
+# 'The cat sat on the mat.'
+
+# Text: LLM replies with a clarification question
+print(handle_message(AgentMessage(text="the cat thing")))
+# 'Do you want me to save that, or search the corpus for cat notes?'
+
+# Attached file + caption (auto-store, then LLM gets the notice + caption)
 with open("notes.pdf", "rb") as f:
     print(handle_message(
         AgentMessage(
-            text="Embed",
+            text="summarize this",
             attachment=Attachment("notes.pdf", f.read()),
         )
     ))
-# 'Ingested 14 chunks from notes.pdf'
-
-# Query (reply contains ONLY the answer string, no contexts)
-print(handle_message(AgentMessage(text="Query Where did the cat sit?")))
-# 'The cat sat on the mat.'
+# '<grounded summary>'  (only the answer)
 ```
+
+The LLM is the routing layer. You do not need to know in advance whether the user wants to save content or ask a question — just hand the message to `handle_message` and the LLM decides. If the configured inference endpoint does not support tool calls, the handler returns a clear error string instead of raising, so the calling code does not need a `try/except`.
 
 ### Wiring it to a transport (sketch)
 
 ```python
-import asyncio
 from rag_qdrant import AgentMessage, Attachment, handle_message
 
 
 def on_user_text(text: str) -> str:
-    try:
-        return handle_message(AgentMessage(text=text))
-    except ValueError as exc:
-        return f"Sorry, I did not understand that. ({exc})"
+    return handle_message(AgentMessage(text=text))
 
 
 def on_user_file(text: str, filename: str, content: bytes) -> str:

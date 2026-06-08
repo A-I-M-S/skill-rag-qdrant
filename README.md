@@ -77,35 +77,42 @@ print(rag.ask("Where did the cat sit?")["answer"])
 
 ### Agent-mode message handler
 
-Pure-library adapter for chat-style transports (Telegram, webhooks, REPLs, openclaw agents). No transport deps — the agent layer converts inbound messages into an `AgentMessage` and sends the returned string back to the user.
+Pure-library adapter for chat-style transports (Telegram, webhooks, REPLs, openclaw agents). No transport deps — the agent layer converts inbound messages into an `AgentMessage` and sends the returned string back to the user. The configured inference model is the sole decision-maker; there are no command prefixes, no `/raw` escape hatches, and no override switches.
 
 ```python
 from rag_qdrant import AgentMessage, Attachment, handle_message
 
-# Embed text
-handle_message(AgentMessage(text="Embed hello world"))
-# 'Ingested 1 chunks from telegram-3b4f0e1a9c2d'
+# Text: LLM routes to store_text
+handle_message(AgentMessage(text="The cat sat on the mat."))
+# 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
 
-# Embed attached file
+# Text: LLM routes to ask_corpus
+handle_message(AgentMessage(text="Where did the cat sit?"))
+# ONLY the answer string, e.g. 'The cat sat on the mat.'
+
+# Text: LLM replies with a clarification question
+handle_message(AgentMessage(text="the cat thing"))
+# 'Do you want me to save that, or search the corpus for cat notes?'
+
+# Attached file (auto-store, then LLM gets the notice + caption)
 handle_message(
     AgentMessage(
-        text="Embed",
+        text="summarize this",
         attachment=Attachment("notes.pdf", open("notes.pdf", "rb").read()),
     )
 )
-# 'Ingested 14 chunks from notes.pdf'
-
-# Query
-handle_message(AgentMessage(text="Query where is the cat?"))
-# ONLY the answer string, e.g. 'The cat sat on the mat.'
+# '<grounded summary>'  (only the answer)
 ```
 
-Rules (case-insensitive prefix match):
+How routing works:
 
-- `Embed <text>` → `ingest_text` with `source = "telegram-<sha1(text[:40])[:12]>"`; ack `Ingested N chunks from <source>`. Empty text falls back to `sha1(utc_iso_timestamp)[:12]` for the source.
-- `Embed` + PDF/TXT/MD/TEXT attachment → temp file + `ingest_file(path, source=<filename>)`; same ack format.
-- `Query <question>` → `ask(question)`, return **only** `result["answer"]` (no score, source, chunk_index, payload, or `contexts` list).
-- `Embed` with no text and no attachment, `Query` with no body, or any non-`Embed`/`Query` text raises `ValueError`. The handler does not produce a graceful reply for those cases.
+- Every inbound `AgentMessage` is sent to the inference model with a system prompt (see `rag_qdrant/prompts.py`) and two tools: `store_text(text, source="")` and `ask_corpus(question)`.
+- LLM calls `store_text` → handler calls `ingest_text` with `source = "auto-<sha1(text[:40])[:12]>"` (or the explicit `source` the LLM passed); ack `Ingested N chunks from <source>`.
+- LLM calls `ask_corpus` → handler calls `ask(question)`, returns **only** `result["answer"]` (no score, source, chunk_index, payload, or `contexts` list).
+- LLM replies without a tool call (greeting, meta-question, clarification) → handler returns the reply verbatim.
+- Attachment with a supported suffix (`.pdf` / `.txt` / `.md` / `.text`) is ingested unconditionally **before** the LLM step; the LLM is told via a prepended notice that the file is already stored. The LLM cannot veto an attachment. An unsupported attachment suffix raises `ValueError`.
+- The handler is **stateless**. The original message is dropped after classification; the next inbound message is classified fresh. If the LLM replies with a clarification question, that's the entire interaction — the user simply answers in a new turn.
+- If the configured inference endpoint does not support tool calls, the handler returns a clear error string instead of raising. No `try/except` is needed in the calling code.
 
 ## Environment
 
@@ -210,7 +217,8 @@ rag_qdrant/
   text_processing.py # extract_text (pdf/txt/md), chunk_text, normalize_text
   inference.py       # ask() / answer_question() — search + LLM
   cache.py           # SemanticCache + SearchCache (opt-in, SQLite-backed)
-  agent_handler.py   # AgentMessage, Attachment, handle_message (chat-style adapter)
+  agent_handler.py   # AgentMessage, Attachment, handle_message (LLM-routed chat-style adapter)
+  prompts.py         # SYSTEM_PROMPT + tool schemas for the LLM-routed flow
   logging_setup.py   # file + stream handler, rotating log file
 references/
   setup.md
@@ -219,7 +227,7 @@ examples/
   agent_usage.md
 tests/
   run_tests.py            # self-contained, no pytest
-  test_agent_handler.py  # source-grep + behavioral checks for the four handler rules
+  test_agent_handler.py   # behavioral tests for the LLM-routed handler + classify_and_route
 SKILL.md                  # openclaw skill frontmatter
 README.md                 # this file
 ```
@@ -230,4 +238,4 @@ README.md                 # this file
 python3 tests/run_tests.py
 ```
 
-The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the cache layer (round-trip, TTL expiry, max-entries eviction, miss flag, ingest invalidation, inference-bypass-when-disabled, inference-cache-hit-when-enabled), the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`) via source-grep + behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.
+The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the cache layer (round-trip, TTL expiry, max-entries eviction, miss flag, ingest invalidation, inference-bypass-when-disabled, inference-cache-hit-when-enabled), the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`) plus the `classify_and_route` wrapper via behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.
