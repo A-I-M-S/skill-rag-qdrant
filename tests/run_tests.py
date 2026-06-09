@@ -158,6 +158,9 @@ def run_config_tests() -> None:
     for field in ("inference_base_url", "inference_api_key", "inference_model", "inference_temperature"):
         expect(f"config_attribute_exists_{field}", hasattr(config_module.Settings, field))
 
+    # Photo storage path attribute
+    expect("config_attribute_exists_photos_dir", hasattr(config_module.Settings, "photos_dir"))
+
     # Defaults are sane
     s = config_module.Settings(
         inference_base_url="https://example.com/v1",
@@ -255,6 +258,7 @@ def run_qdrant_store_tests() -> None:
         "ensure_payload_indexes",
         "ingest_text",
         "ingest_file",
+        "ingest_photo",
         "search",
         "collection_stats",
         "embed_texts",
@@ -267,6 +271,7 @@ def run_qdrant_store_tests() -> None:
     expect("qdrant_store_indexes_source", '"source"' in src_lines)
     expect("qdrant_store_indexes_file_name", '"file_name"' in src_lines)
     expect("qdrant_store_indexes_file_type", '"file_type"' in src_lines)
+    expect("qdrant_store_indexes_kind", '"kind"' in src_lines)
     expect("qdrant_store_uses_cosine_distance", "models.Distance.COSINE" in src_lines)
 
     # custom FastEmbed model registration still present
@@ -379,6 +384,12 @@ def run_public_api_tests() -> None:
     for name in (
         "ingest_text",
         "ingest_file",
+        "ingest_photo",
+        "extract_photos",
+        "Photo",
+        "AgentMessage",
+        "AgentReply",
+        "Attachment",
         "ask",
         "search",
         "stats",
@@ -398,6 +409,7 @@ def run_public_api_tests() -> None:
         "ensure_collection",
         "ingest_text",
         "ingest_file",
+        "ingest_photo",
         "search",
         "ask",
         "stats",
@@ -486,7 +498,20 @@ def run_cli_tests() -> None:
 # Agent handler tests (delegated to tests/test_agent_handler.py)
 # ---------------------------------------------------------------------------
 
+def run_agent_handler_shape_tests() -> None:
+    """Source-grep checks for the agent handler data model and return type."""
+    import rag_qdrant.agent_handler as _handler
+    src = inspect.getsource(_handler)
+    expect("agent_handler_uses_tuple_attachments", "attachments: tuple" in src)
+    expect("agent_handler_uses_tuple_photos", "photos: tuple" in src)
+    expect("agent_handler_returns_agent_reply", "-> AgentReply" in src or "AgentReply" in src)
+    expect("agent_handler_defines_AgentReply", "class AgentReply" in src)
+    # Photo is imported from photo_store, not defined here, so look for the import.
+    expect("agent_handler_imports_Photo", "from .photo_store import" in src and "Photo" in src)
+
+
 def run_agent_handler_tests() -> None:
+    run_agent_handler_shape_tests()
     import test_agent_handler  # noqa: E402
     test_agent_handler.main()
 

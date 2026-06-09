@@ -75,6 +75,7 @@ def ensure_payload_indexes() -> None:
         "source": models.PayloadSchemaType.KEYWORD,
         "file_name": models.PayloadSchemaType.KEYWORD,
         "file_type": models.PayloadSchemaType.KEYWORD,
+        "kind": models.PayloadSchemaType.KEYWORD,
     }
     for field, schema in field_schemas.items():
         try:
@@ -151,6 +152,47 @@ def ingest_file(path: Path, *, source: str | None = None, metadata: dict[str, An
     logger.info("ingest_file_start path=%s source=%s", path, source_name)
     count = ingest_text(text, source=source_name, metadata=payload_metadata)
     logger.info("ingest_file_done path=%s source=%s chunks=%s", path, source_name, count)
+    return count
+
+
+def ingest_photo(
+    photo_path: Path,
+    *,
+    description: str,
+    source: str,
+    photo_filename: str,
+    sha256_hex: str,
+    file_type: str,
+) -> int:
+    """Ingest a photo's description as a single chunk in the Qdrant collection.
+
+    The photo bytes are NOT embedded — only the user-supplied
+    description is. The payload carries enough metadata for the
+    agent handler to surface the saved photo path on future matches:
+
+    - ``text`` = the description (set by :func:`ingest_text`)
+    - ``source`` = ``photo-<sha256[:12]>`` (caller-supplied)
+    - ``photo_path`` = absolute path to the bytes on disk
+    - ``photo_filename`` = original filename
+    - ``file_type`` = lowercase extension including the dot
+    - ``kind`` = ``"photo"`` (used by :mod:`rag_qdrant.photo_matching`
+      to recognize the point on a search hit)
+    - ``sha256`` = full hex digest of the bytes
+    """
+    resolved = photo_path.resolve()
+    payload_metadata = {
+        "photo_path": str(resolved),
+        "photo_filename": photo_filename,
+        "file_type": file_type,
+        "kind": "photo",
+        "sha256": sha256_hex,
+    }
+    logger.info(
+        "ingest_photo_start path=%s source=%s description_chars=%s",
+        resolved, source, len(description or ""),
+    )
+    count = ingest_text(description, source=source, metadata=payload_metadata)
+    logger.info("ingest_photo_done path=%s source=%s chunks=%s", resolved, source, count)
     return count
 
 

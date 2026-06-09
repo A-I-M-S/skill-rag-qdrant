@@ -59,6 +59,15 @@ to decide whether to call `ask_corpus` (when the rest of the message \
 is a question about the file) or `store_text` (when the rest of the \
 message is additional text to save) or the chat path.
 
+When the prepended line matches the form `Ingested N chunks from \
+photo-<hash> (<filename>)`, the user's photo is already saved on disk \
+and its description is already searchable in the corpus. The system \
+will automatically attach the photo to the final reply if a future \
+`ask_corpus` call matches it — you do not need to (and must not) \
+mention photo paths, file IDs, or the on-disk location in your \
+visible answer. Just call `ask_corpus` with the user's question and \
+the system handles the photo display.
+
 Be concise. One tool call per turn, or a short chat reply. Never call \
 both tools in the same turn.
 """

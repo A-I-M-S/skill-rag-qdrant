@@ -67,6 +67,7 @@ from typing import Any
 
 from .config import settings
 from .logging_setup import logger
+from .photo_matching import extract_photos
 from .text_processing import normalize_text
 
 # ---------------------------------------------------------------------------
@@ -277,6 +278,7 @@ class SemanticCache:
                 return {
                     "answer": best_answer,
                     "contexts": json.loads(best_contexts_json) if best_contexts_json else [],
+                    "photos": extract_photos(json.loads(best_contexts_json) if best_contexts_json else []),
                 }
         except sqlite3.OperationalError as exc:
             logger.warning("semantic_cache_lookup_failed error=%s", exc)
