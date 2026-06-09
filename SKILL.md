@@ -8,7 +8,7 @@ metadata:
     requires:
       bins: ["python"]
       anyBins: []
-      env: ["QDRANT_URL", "QDRANT_API_KEY", "INFERENCE_BASE_URL", "INFERENCE_API_KEY", "INFERENCE_MODEL"]
+      env: ["QDRANT_URL", "QDRANT_API_KEY", "INFERENCE_BASE_URL", "INFERENCE_API_KEY", "INFERENCE_MODEL", "RAG_PHOTOS_DIR"]
     primaryEnv: "INFERENCE_API_KEY"
     install:
       - id: pip
@@ -190,41 +190,114 @@ The handler is **stateless**. The original message is dropped after classificati
 
 ### Attachments
 
-If `message.attachment` is present and the suffix is `.pdf` / `.txt` / `.md` / `.text`, the handler ingests the file unconditionally **before** the LLM step and builds an `Ingested N chunks from <filename>` notice. The LLM cannot veto an attachment; once sent, it's stored. The notice is prepended to the LLM's view of the user message, so the LLM knows the file is already in the corpus and can call `ask_corpus` if the caption is a question about it. An unsupported attachment suffix (anything other than `.pdf` / `.txt` / `.md` / `.text`) raises `ValueError`.
+If `message.attachments` contains any files whose suffix is `.pdf` / `.txt` / `.md` / `.text`, the handler ingests each one unconditionally **before** the LLM step and builds one `Ingested N chunks from <filename>` notice line per file. The LLM cannot veto an attachment; once sent, it's stored. The combined notice is prepended to the LLM's view of the user message, so the LLM knows the files are already in the corpus and can call `ask_corpus` if the caption is a question about them. An unsupported attachment suffix (anything other than `.pdf` / `.txt` / `.md` / `.text`) raises `ValueError`.
 
 ### Example
 
 ```python
-from rag_qdrant import AgentMessage, Attachment, handle_message
+from rag_qdrant import AgentMessage, AgentReply, Attachment, handle_message
 
 # Text: LLM routes to store_text
-reply = handle_message(AgentMessage(text="The cat sat on the mat."))
-# -> 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
+reply: AgentReply = handle_message(AgentMessage(text="The cat sat on the mat."))
+# reply.text     == 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
+# reply.photo_paths == ()
 
 # Text: LLM routes to ask_corpus
 reply = handle_message(AgentMessage(text="Where did the cat sit?"))
-# -> 'The cat sat on the mat.'   (only the answer, no contexts)
+# reply.text     == 'The cat sat on the mat.'   (only the answer, no contexts)
+# reply.photo_paths == ()  (no matched photos)
 
 # Text: LLM replies with a clarification question
 reply = handle_message(AgentMessage(text="the cat thing"))
-# -> 'Do you want me to save that, or search the corpus for cat notes?'
+# reply.text     == 'Do you want me to save that, or search the corpus for cat notes?'
 
 # Attached file (auto-store, then LLM gets the notice + caption)
 reply = handle_message(
     AgentMessage(
         text="summarize this",
-        attachment=Attachment("notes.pdf", open("notes.pdf", "rb").read()),
+        attachments=(Attachment("notes.pdf", open("notes.pdf", "rb").read()),),
     )
 )
-# -> '<grounded summary>'  (only the answer)
+# reply.text     == '<grounded summary>'  (only the answer)
+# reply.photo_paths == ()
 ```
 
 See `examples/agent_usage.md` for the full integration pattern.
+
+## Photo support
+
+Photos uploaded with a description are stored on disk and embedded by description. A future query that matches the description automatically surfaces the photo on the agent's reply — no opt-in flag, no extra tool call, no LLM awareness of paths.
+
+Public types: `Photo(filename, content, description)`, `AgentReply(text, photo_paths)`. Configuration: env var `RAG_PHOTOS_DIR`, default `/root/rag-photos`.
+
+### Storage layout
+
+Photos are saved to `<RAG_PHOTOS_DIR>/<sha256(bytes)[:16]>.<ext>` where `<ext>` is the lowercase original extension (with the dot, or empty if the original has none). The directory is created on the first write. Identical bytes + same filename suffix dedupe automatically: only one file is ever written for a given content + filename, and a second call returns the same path. The skill does not decode the bytes — it stores them verbatim.
+
+### Description is required
+
+The user-supplied description is the **only** signal that gets embedded into the vector index, and it becomes the chunk text verbatim (no templating like `"Photo: <desc>"`). Empty or whitespace-only descriptions raise `ValueError` before any disk or Qdrant work. Supported extensions: `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`, `.tiff`, `.heic`, `.heif`. A missing extension is accepted; a present-but-unrecognized extension raises `ValueError`.
+
+### Qdrant payload
+
+A photo point in the corpus carries: `text` = the description, `source` = `photo-<sha256[:12]>`, `chunk_index` = 0, `chunk_count` = 1, `photo_path` = absolute path on disk, `photo_filename` = original filename, `file_type` = lowercase extension with the dot, `kind` = `"photo"`, `sha256` = full hex digest. The same point ID is reused when re-ingesting the same photo with the same description (idempotent); a different description produces a second point under the same source.
+
+### Ingest is unconditional
+
+The LLM cannot veto a photo. Once `Photo` is on the `AgentMessage`, it is saved to disk and its description is embedded — mirroring the existing attachment path. The handler builds an `Ingested 1 chunk from photo-<hash> (<filename>)` notice line per photo; for a multi-photo turn the lines are joined with `\n`.
+
+### `ask_corpus` → matched photos
+
+When the LLM routes to `ask_corpus`, `rag_qdrant.ask` returns the matched contexts plus a `photos` list (deduped by `photo_path`, first-seen order). The handler copies those paths into `AgentReply.photo_paths` and strips the LLM-facing metadata (no scores, sources, payloads, or paths in the visible answer). The LLM itself never sees the photo paths — only the system enriches the reply.
+
+### Example
+
+```python
+from rag_qdrant import AgentMessage, AgentReply, Photo, handle_message
+
+# Photo only — saved to disk, description embedded, ack lists the photo.
+with open("sunset.jpg", "rb") as f:
+    reply: AgentReply = handle_message(AgentMessage(
+        text="",
+        photos=(Photo("sunset.jpg", f.read(), "a sunset over the bay"),),
+    ))
+# reply.text     == 'Ingested 1 chunk from photo-5c6fb3dfe09f (sunset.jpg)'
+# reply.photo_paths == ('/root/rag-photos/5c6fb3dfe09f.jpg',)
+
+# Photo + caption — file saved, then LLM is asked about the photo.
+with open("sunset.jpg", "rb") as f:
+    reply = handle_message(AgentMessage(
+        text="what does this look like?",
+        photos=(Photo("sunset.jpg", f.read(), "a sunset over the bay"),),
+    ))
+# reply.text     == '<grounded answer from the LLM>'
+# reply.photo_paths == ('/root/rag-photos/5c6fb3dfe09f.jpg',)  (or empty if no match)
+```
+
+Programmatic use (no agent transport):
+
+```python
+from rag_qdrant import Photo, RAG
+
+rag = RAG()
+with open("sunset.jpg", "rb") as f:
+    rag.ingest_photo(Photo("sunset.jpg", f.read(), "a sunset over the bay"))
+
+result = rag.ask("Show me sunsets.")
+# result["answer"] == '<grounded answer>'
+# result["photos"] == [{'path': '/root/rag-photos/5c6fb3dfe09f.jpg',
+#                        'filename': 'sunset.jpg',
+#                        'source': 'photo-5c6fb3dfe09f',
+#                        'score': 0.91}]
+```
 
 ## References
 
 - `references/setup.md` — environment variables, Qdrant Cloud vs. local, FastEmbed model selection, OpenAI-compatible endpoint config
 - `examples/ingest_cli.md` — worked examples of `init`, `ingest-text`, `ingest-file`, `ask`
 - `examples/agent_usage.md` — how an openclaw agent imports and calls the skill programmatically
-- `rag_qdrant/agent_handler.py` — `AgentMessage`, `Attachment`, `handle_message` (the chat-style adapter described above)
+- `rag_qdrant/agent_handler.py` — `AgentMessage`, `AgentReply`, `Attachment`, `Photo`, `handle_message` (the chat-style adapter described above)
+- `rag_qdrant/photo_store.py` — `Photo` dataclass + `save_photo` (content-addressed on-disk dedupe)
+- `rag_qdrant/photo_matching.py` — `extract_photos(contexts)` for the `ask_corpus` photo propagation
+- `rag_qdrant/qdrant_store.py` — `ingest_photo(...)` (description-as-chunk)
 - `rag_qdrant/cache.py` — `SemanticCache` + `SearchCache` (the caching layer described above)

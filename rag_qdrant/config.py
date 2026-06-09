@@ -63,6 +63,7 @@ class Settings:
     inference_temperature: float = _float_env("INFERENCE_TEMPERATURE", 0.2)
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file: Path = SKILL_ROOT / os.getenv("LOG_FILE", "logs/rag-qdrant.log")
+    photos_dir: Path = Path(_env("RAG_PHOTOS_DIR", "/root/rag-photos"))
 
     semantic_cache_enabled: bool = _bool_env("SEMANTIC_CACHE_ENABLED", False)
     semantic_cache_path: Path = SKILL_ROOT / os.getenv("SEMANTIC_CACHE_PATH", "logs/semantic_cache.sqlite")

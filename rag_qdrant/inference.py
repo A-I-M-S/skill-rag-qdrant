@@ -10,6 +10,7 @@ from .cache import (
 )
 from .config import settings
 from .logging_setup import logger
+from .photo_matching import extract_photos
 from .prompts import Action, SYSTEM_PROMPT as _ROUTING_SYSTEM_PROMPT
 from .qdrant_store import embed_texts, search
 
@@ -54,7 +55,7 @@ def answer_question(question: str) -> dict:
     contexts = [item for item in contexts if float(item.get("score") or 0) >= settings.min_relevance_score]
     if not contexts:
         logger.info("inference_no_relevant_context question_chars=%s min_relevance_score=%s", len(question), settings.min_relevance_score)
-        result = {"answer": NO_RELEVANT_ANSWER, "contexts": []}
+        result = {"answer": NO_RELEVANT_ANSWER, "contexts": [], "photos": []}
         if settings.semantic_cache_enabled and query_embedding is not None:
             semantic_cache_store(question, query_embedding, result, is_miss=True)
         return result
@@ -71,7 +72,7 @@ def answer_question(question: str) -> dict:
         settings.inference_model,
         len(answer),
     )
-    result = {"answer": answer, "contexts": contexts}
+    result = {"answer": answer, "contexts": contexts, "photos": extract_photos(contexts)}
     if settings.semantic_cache_enabled and query_embedding is not None:
         semantic_cache_store(question, query_embedding, result, is_miss=False)
     return result

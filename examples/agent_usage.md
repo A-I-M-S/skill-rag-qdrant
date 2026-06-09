@@ -145,19 +145,19 @@ Return the raw dicts to the model. The `contexts` list is useful for agentic loo
 
 ## Agent-mode message handler
 
-The `AgentMessage` / `Attachment` / `handle_message` triple adapts the skill to a chat-style transport. The handler is pure library code: it does not import any chat-transport package, does not perform network I/O of its own, and does not read `.env`. The agent layer is responsible for turning inbound traffic into an `AgentMessage` and for sending the returned string back to the user.
+The `AgentMessage` / `AgentReply` / `Attachment` / `Photo` / `handle_message` surface adapts the skill to a chat-style transport. The handler is pure library code: it does not import any chat-transport package, does not perform network I/O of its own, and does not read `.env`. The agent layer is responsible for turning inbound traffic into an `AgentMessage` and for sending the returned `AgentReply` back to the user (text + optional photo paths to attach to the message).
 
 ### How routing works
 
 The configured inference model is the **sole** decision-maker. There are no command prefixes, no `/raw` escape hatches, and no override switches — the user does not have to phrase their request in any particular way. Every inbound turn is sent to the LLM with the system prompt and two tools (`store_text` and `ask_corpus`, see `rag_qdrant/prompts.py`); the LLM picks exactly one action or replies directly.
 
-The handler's three reply shapes:
+The handler returns an `AgentReply(text, photo_paths)` from every branch:
 
-| LLM decision | Handler action | Reply to the user |
-| --- | --- | --- |
-| `store_text(text)` (with optional `source`) | `ingest_text(text, source="auto-<sha1(text[:40])[:12]>")` (or the explicit `source` the LLM passed) | `Ingested N chunks from <source>` |
-| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
-| No tool call (greeting, meta-question, clarification) | pass through | the LLM's reply, verbatim |
+| LLM decision | Handler action | `reply.text` | `reply.photo_paths` |
+| --- | --- | --- | --- |
+| `store_text(text)` (with optional `source`) | `ingest_text(text, source="auto-<sha1(text[:40])[:12]>")` (or the explicit `source` the LLM passed) | `Ingested N chunks from <source>` | `()` |
+| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list | `()` (or matched photo paths) |
+| No tool call (greeting, meta-question, clarification) | pass through | the LLM's reply, verbatim | `()` |
 
 Default source naming for `store_text`: `auto-<sha1[:12]>` of the first 40 characters of the stripped text. When the text is empty, the hash input falls back to the current UTC timestamp so each ingest still gets a unique source.
 
@@ -167,52 +167,131 @@ The handler is **stateless**. The original message is dropped after classificati
 
 ### Attachments
 
-If the inbound `AgentMessage` has a supported attachment (`.pdf` / `.txt` / `.md` / `.text`), the handler ingests the file unconditionally **before** the LLM step and builds an `Ingested N chunks from <filename>` notice. The LLM cannot veto an attachment — once sent, it's stored. The notice is prepended to the LLM's view of the user message, so the LLM knows the file is already in the corpus and can call `ask_corpus` if the caption is a question about it. An unsupported attachment suffix raises `ValueError` (the only `ValueError` left in the handler).
+If the inbound `AgentMessage` carries any supported attachments (`.pdf` / `.txt` / `.md` / `.text`), the handler ingests each one unconditionally **before** the LLM step and builds one `Ingested N chunks from <filename>` notice line per file. The LLM cannot veto an attachment — once sent, it's stored. The combined notice is prepended to the LLM's view of the user message, so the LLM knows the files are already in the corpus and can call `ask_corpus` if the caption is a question about them. An unsupported attachment suffix raises `ValueError` (the only `ValueError` left in the text/attachment path).
 
 ### End-to-end examples
 
 ```python
-from rag_qdrant import AgentMessage, Attachment, handle_message
+from rag_qdrant import AgentMessage, AgentReply, Attachment, handle_message
 
 # Text: LLM routes to store_text
-print(handle_message(AgentMessage(text="The cat sat on the mat.")))
-# 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
+reply: AgentReply = handle_message(AgentMessage(text="The cat sat on the mat."))
+# reply.text     == 'Ingested 1 chunks from auto-3b4f0e1a9c2d'
+# reply.photo_paths == ()
 
-# Text: LLM routes to ask_corpus (reply is ONLY the answer string)
-print(handle_message(AgentMessage(text="Where did the cat sit?")))
-# 'The cat sat on the mat.'
+# Text: LLM routes to ask_corpus (reply.text is ONLY the answer string)
+reply = handle_message(AgentMessage(text="Where did the cat sit?"))
+# reply.text     == 'The cat sat on the mat.'
+# reply.photo_paths == ()
 
 # Text: LLM replies with a clarification question
-print(handle_message(AgentMessage(text="the cat thing")))
-# 'Do you want me to save that, or search the corpus for cat notes?'
+reply = handle_message(AgentMessage(text="the cat thing"))
+# reply.text     == 'Do you want me to save that, or search the corpus for cat notes?'
 
 # Attached file + caption (auto-store, then LLM gets the notice + caption)
 with open("notes.pdf", "rb") as f:
-    print(handle_message(
-        AgentMessage(
-            text="summarize this",
-            attachment=Attachment("notes.pdf", f.read()),
-        )
+    reply = handle_message(AgentMessage(
+        text="summarize this",
+        attachments=(Attachment("notes.pdf", f.read()),),
     ))
-# '<grounded summary>'  (only the answer)
+# reply.text     == '<grounded summary>'
+# reply.photo_paths == ()
 ```
 
-The LLM is the routing layer. You do not need to know in advance whether the user wants to save content or ask a question — just hand the message to `handle_message` and the LLM decides. If the configured inference endpoint does not support tool calls, the handler returns a clear error string instead of raising, so the calling code does not need a `try/except`.
+The LLM is the routing layer. You do not need to know in advance whether the user wants to save content or ask a question — just hand the message to `handle_message` and the LLM decides. If the configured inference endpoint does not support tool calls, the handler returns a clear error string in `reply.text` instead of raising, so the calling code does not need a `try/except`.
 
 ### Wiring it to a transport (sketch)
 
 ```python
-from rag_qdrant import AgentMessage, Attachment, handle_message
+from rag_qdrant import AgentMessage, AgentReply, Attachment, handle_message
 
 
-def on_user_text(text: str) -> str:
+def on_user_text(text: str) -> AgentReply:
     return handle_message(AgentMessage(text=text))
 
 
-def on_user_file(text: str, filename: str, content: bytes) -> str:
+def on_user_file(text: str, filename: str, content: bytes) -> AgentReply:
     return handle_message(
-        AgentMessage(text=text, attachment=Attachment(filename, content))
+        AgentMessage(text=text, attachments=(Attachment(filename, content),))
     )
 ```
 
-The agent / bot framework is responsible for collecting `(text, file_name, file_bytes)` from the transport and calling the helpers above.
+The agent / bot framework is responsible for collecting `(text, file_name, file_bytes)` from the transport, calling the helpers above, and rendering the returned `AgentReply` to the user (text + any photos in `reply.photo_paths`).
+
+## Photo support
+
+Photos uploaded with a description are stored on disk and embedded by description. A future query that matches the description automatically surfaces the photo on the agent's reply — no opt-in flag, no extra tool call, no LLM awareness of paths.
+
+- **Storage**: `<RAG_PHOTOS_DIR>/<sha256(bytes)[:16]>.<ext>`. Default `RAG_PHOTOS_DIR=/root/rag-photos`. Directory is created on first write. Identical bytes dedupe on disk.
+- **Description required**: the description is the only searchable signal and becomes the chunk text verbatim. Empty / whitespace descriptions raise `ValueError`. Supported extensions: `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`, `.tiff`, `.heic`, `.heif`. Missing extension is accepted.
+- **Unconditional ingest**: like attachments, the LLM cannot veto a photo.
+- **`ask_corpus` propagation**: matched photos from `result["photos"]` flow into `AgentReply.photo_paths`. The LLM never sees the paths.
+- **Multiple photos in one message**: each is saved and ingested separately, each gets its own source (`photo-<sha12>`), each gets its own notice line.
+
+### Examples
+
+```python
+from rag_qdrant import AgentMessage, AgentReply, Photo, handle_message
+
+# Photo only — saved to disk, description embedded, ack lists the photo.
+with open("sunset.jpg", "rb") as f:
+    reply: AgentReply = handle_message(AgentMessage(
+        text="",
+        photos=(Photo("sunset.jpg", f.read(), "a sunset over the bay"),),
+    ))
+# reply.text     == 'Ingested 1 chunk from photo-5c6fb3dfe09f (sunset.jpg)'
+# reply.photo_paths == ('/root/rag-photos/5c6fb3dfe09f.jpg',)
+
+# Photo + caption — file saved, then LLM is asked about the photo.
+with open("sunset.jpg", "rb") as f:
+    reply = handle_message(AgentMessage(
+        text="what does this look like?",
+        photos=(Photo("sunset.jpg", f.read(), "a sunset over the bay"),),
+    ))
+# reply.text     == '<grounded answer from the LLM>'
+# reply.photo_paths == ('/root/rag-photos/5c6fb3dfe09f.jpg',)  (or empty)
+
+# Multiple photos + text in one turn — each photo saved, ack lists each.
+with open("a.jpg", "rb") as fa, open("b.jpg", "rb") as fb:
+    reply = handle_message(AgentMessage(
+        text="any matches?",
+        photos=(
+            Photo("a.jpg", fa.read(), "first photo"),
+            Photo("b.jpg", fb.read(), "second photo"),
+        ),
+    ))
+# reply.text     == '<multi-line ack + LLM reply, separated by a blank line>'
+# reply.photo_paths == (...)  (matched photos from the LLM's ask_corpus call)
+```
+
+### Telegram-style flow
+
+```python
+from rag_qdrant import AgentMessage, AgentReply, Photo, handle_message
+
+
+def on_user_photo_with_caption(caption: str, photo_bytes: bytes, filename: str) -> AgentReply:
+    return handle_message(AgentMessage(
+        text=caption,
+        photos=(Photo(filename, photo_bytes, caption or "user-uploaded photo"),),
+    ))
+
+
+# On a photo with no caption: use a generated description or fall back to a
+# prompt that asks the LLM to invent one. The skill requires a non-empty
+# description — the transport layer is responsible for producing one.
+def on_user_photo_no_caption(photo_bytes: bytes, filename: str) -> AgentReply:
+    return handle_message(AgentMessage(
+        text="",
+        photos=(Photo(filename, photo_bytes, "user-uploaded photo"),),
+    ))
+
+
+def render(reply: AgentReply) -> None:
+    # Send reply.text to the chat. Then, for each path in reply.photo_paths,
+    # send the corresponding photo back to the user. The transport layer
+    # reads the file from disk and attaches it to the outbound message.
+    send_text(reply.text)
+    for path in reply.photo_paths:
+        send_photo_file(path)
+```
