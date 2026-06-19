@@ -62,6 +62,9 @@ from rag_qdrant import (
     ensure_collection, ingest_text, ingest_file, ingest_photo,
     extract_photos,
     ask, search, stats, settings,
+    grant_access, revoke_access, show_access,
+    is_admin, admin_telegram_ids,
+    record_seen, resolve_username, resolve_id,
 )
 ```
 
@@ -72,6 +75,16 @@ from rag_qdrant import RAG
 rag = RAG()
 rag.ingest_text("The cat sat on the mat.", source="manual-note")
 print(rag.ask("Where did the cat sit?")["answer"])
+
+# Restrict a piece of info at ingest time.
+rag.ingest_text(
+    "Q3 launches in August.", source="q3-launch",
+    allowed_telegram_ids=[428765901],
+)
+
+# Admin-only search sees everything; non-admin sees only their ACL.
+rag.search("what's the launch plan?", allowed_telegram_id=428765901)
+rag.ask("what's the launch plan?", current_telegram_id=428765901)
 ```
 
 `RAG(...)` takes an optional `Settings` instance. The module-level `settings` is a frozen dataclass built from `.env` at import time.
@@ -166,6 +179,7 @@ Required:
 
 - `QDRANT_URL`, `QDRANT_API_KEY` — Qdrant instance (Cloud or self-hosted)
 - `INFERENCE_BASE_URL`, `INFERENCE_API_KEY`, `INFERENCE_MODEL` — any OpenAI-compatible chat endpoint
+- `ADMIN_TELEGRAM_IDS` — comma-separated list of Telegram user ids. Required at import time; missing / empty / non-integer values are fail-closed (the process exits with a clear `RuntimeError`). The list is read **once at import** and frozen; later mutations to `.env` have no effect until the next process restart.
 
 Optional, with defaults:
 
@@ -179,6 +193,7 @@ Optional, with defaults:
 - `INFERENCE_TEMPERATURE` (default `0.2`)
 - `LOG_LEVEL`, `LOG_FILE`
 - `RAG_PHOTOS_DIR` (default `/root/rag-photos`) — content-addressed photo storage directory; created on first write
+- `RAG_USER_CACHE_PATH` (default `logs/user_cache.json`) — local cache of `telegram_id` ↔ `@username` mappings, populated automatically on every inbound message. Created with mode `0600`. Required for the admin to refer to users by `@username` (e.g. "let @alice see the Q3 note"); see [Access control](#access-control).
 
 Caching (opt-in, both disabled by default — see [Caching](#caching) below):
 
@@ -195,6 +210,103 @@ Caching (opt-in, both disabled by default — see [Caching](#caching) below):
 - `SEARCH_CACHE_MAX_ENTRIES` (default `5000`)
 
 See `references/setup.md` for full details, including Qdrant Cloud and local Qdrant instructions, FastEmbed model selection notes, and OpenAI-compatible endpoint configuration.
+
+## Access control
+
+Every stored chunk carries an `allowed_telegram_ids` payload field. The agent-mode message handler (and any caller of `ask` / `search`) applies an ACL filter server-side before the LLM ever sees the contexts. Non-admins never see chunks whose ACL excludes them, and the bot's "nothing on that." reply is the same whether the chunk genuinely doesn't exist or is just restricted.
+
+### Public vs restricted
+
+- **Public** — `allowed_telegram_ids` is omitted from the payload at ingest time. Every user (admin or not) can read these chunks via `ask` / `search`.
+- **Restricted** — `allowed_telegram_ids` is set to a non-empty list of Telegram user ids. Only users whose id is in the list, plus admins, can read the chunks.
+- **Public marker** — setting `allowed_telegram_ids=["*"]` explicitly marks a chunk as public-by-marker (visible to everyone), same as omitting the field.
+
+### At ingest time
+
+```python
+from rag_qdrant import RAG
+
+rag = RAG()
+
+# Public (no allowed_telegram_ids arg).
+rag.ingest_text("The cat sat on the mat.", source="manual-note")
+
+# Restricted to specific users.
+rag.ingest_text("Q3 launch plan: August.", source="q3-launch",
+                allowed_telegram_ids=[123, 456])
+
+# Explicit public marker.
+rag.ingest_text("Anyone can read this.", source="public-doc",
+                allowed_telegram_ids=["*"])
+```
+
+CLI equivalent:
+
+```bash
+python -m rag_qdrant ingest-text "Q3 launch plan: August." \
+    --source q3-launch --allowed-telegram-ids 123,456
+
+# Explicit "no one except admins" via the --no-access flag:
+python -m rag_qdrant ingest-text "private" --source private --no-access
+```
+
+### At read time
+
+```python
+from rag_qdrant import ask, search
+
+# Admin (sees everything).
+ask("what's the Q3 plan?", current_telegram_id=920567169)
+
+# Non-admin (sees only public + their own ACL).
+ask("what's the Q3 plan?", current_telegram_id=123)
+
+# CLI defaults to public-only (wildcard + missing-field filter).
+python -m rag_qdrant ask "what's the Q3 plan?" --telegram-id 123
+```
+
+### Admin tools
+
+Admins (per `ADMIN_TELEGRAM_IDS`) get four extra tools in the agent-mode handler:
+
+| Tool | What it does |
+| --- | --- |
+| `grant_access(source, telegram_id)` | Append a Telegram user (numeric id or `@username`) to the ACL of every chunk under `source`. |
+| `revoke_access(source, telegram_id)` | Remove a Telegram user from the ACL of every chunk under `source`. |
+| `show_access(source)` | Show the current ACL + chunk count for `source`. |
+| `resolve_username(username)` | Look up a `@username` and return the numeric Telegram id + display name. |
+
+These are admin-only. A non-admin caller asking for them gets "This action is only available to admins." — no Qdrant write happens. The LLM cannot bypass the gate; the handler re-checks the caller's role after the model decides which tool to call.
+
+CLI equivalents:
+
+```bash
+python -m rag_qdrant grant-access q3-launch 123
+python -m rag_qdrant revoke-access q3-launch 123
+python -m rag_qdrant show-access q3-launch
+```
+
+### `@username` resolution
+
+Telegram only lets the bot look up a user by username when the user has **already messaged the bot at least once**. The skill works around this by recording every inbound sender's `telegram_id` / `username` / `first_name` in `RAG_USER_CACHE_PATH` (default `logs/user_cache.json`) the moment a message arrives. The file is created with mode `0600` (owner read/write only). Admins can then reference any seen user by `@username`:
+
+```
+> let @alice see the Q3 note
+Granted access to 428765901 for source q3-launch (3 chunk(s) updated).
+```
+
+When the user hasn't been seen yet, the bot replies with "That user hasn't messaged this bot yet. Ask them to send any message to the bot first, then try again." — no Qdrant write happens.
+
+### Cache bypass
+
+The semantic cache and search cache are **bypassed entirely for non-admin user-specific queries**. Admin queries (and CLI queries with no `current_telegram_id`) use the cache as normal. This prevents a non-admin from receiving an answer that was cached for a different user. See [Caching](#caching) for the cache layer itself.
+
+### Security notes
+
+- `ADMIN_TELEGRAM_IDS` is read **once at import time** and frozen. Mutating `.env` after the process starts has no effect until the next restart.
+- Admin checks are enforced **server-side**. The LLM's tool choice is re-validated against the caller's role before any Qdrant write; the model cannot escalate privileges or skip the check.
+- The local `@username` cache file (`RAG_USER_CACHE_PATH`) holds Telegram user ids, not secrets. It is created with mode `0600` (POSIX only); the operator can tighten or loosen permissions afterwards if needed.
+- Chunk ACLs are stored as a Qdrant payload field (`allowed_telegram_ids`). They are **not** an authentication mechanism — anyone with Qdrant access can read or modify them directly. Restrict Qdrant credentials accordingly (`QDRANT_API_KEY`).
 
 ## Examples
 
@@ -258,12 +370,13 @@ All major operations log to `logs/rag-qdrant.log` and stderr with a single share
 ```
 rag_qdrant/
   __init__.py        # public API (RAG, flat functions, settings, agent handler, __version__)
-  __main__.py        # CLI: init, stats, ingest-file, ingest-text, search, ask, cache-*
-  config.py          # Settings dataclass, .env loading
-  qdrant_store.py    # collection, indexes, ingest_text, ingest_file, search
+  __main__.py        # CLI: init, stats, ingest-*, search, ask, cache-*, grant/revoke/show-access
+  config.py          # Settings dataclass, .env loading, ADMIN_TELEGRAM_IDS
+  qdrant_store.py    # collection, indexes, ingest_text, ingest_file, search, grant/revoke/show_access
   text_processing.py # extract_text (pdf/txt/md), chunk_text, normalize_text
   inference.py       # ask() / answer_question() — search + LLM
   cache.py           # SemanticCache + SearchCache (opt-in, SQLite-backed)
+  user_cache.py      # local telegram_id <-> @username cache (file, 0600)
   agent_handler.py   # AgentMessage, AgentReply, Attachment, Photo, handle_message (LLM-routed chat-style adapter)
   photo_store.py     # Photo dataclass + save_photo (content-addressed disk dedupe)
   photo_matching.py  # extract_photos(contexts) for ask_corpus photo propagation
@@ -285,6 +398,7 @@ README.md                 # this file
 
 ```bash
 python3 tests/run_tests.py
+python3 tests/test_agent_handler.py
 ```
 
-The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the cache layer (round-trip, TTL expiry, max-entries eviction, miss flag, ingest invalidation, inference-bypass-when-disabled, inference-cache-hit-when-enabled), the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`) plus the `classify_and_route` wrapper via behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.
+The test suite is self-contained (no pytest). It covers config field shape, `chunk_text`, `extract_text`, `qdrant_store` shape, the `inference` module shape, the cache layer (round-trip, TTL expiry, max-entries eviction, miss flag, ingest invalidation, inference-bypass-when-disabled, inference-cache-hit-when-enabled, cache bypass for non-admin user-specific calls), the ACL data model (ingest payload field, search filter shape, grant / revoke / show behavior, role gate fail-closed config), the local `@username` ↔ `telegram_id` cache (record, resolve, miss, concurrent writes, atomic write, file mode), the grumpy-office-worker persona (no forbidden phrases, no exclamation marks, the "Nothing on that." override), the agent-mode message handler (`AgentMessage` / `Attachment` / `handle_message`), the admin tools (`grant_access` / `revoke_access` / `show_access` / `resolve_username`, including `@username` resolution end-to-end) plus the `classify_and_route` wrapper via behavioral checks, and a repo-wide grep that asserts no OpenRouter / Telegram stragglers remain.

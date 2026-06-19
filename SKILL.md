@@ -1,6 +1,6 @@
 ---
 name: rag-qdrant
-description: Local RAG skill that ingests text/PDF/MD into Qdrant and answers questions with a single OpenAI-compatible chat endpoint. Uses FastEmbed multilingual E5 embeddings and a configurable Qdrant collection.
+description: Local RAG skill that ingests text/PDF/MD/photos into Qdrant and answers questions with a single OpenAI-compatible chat endpoint. Per-chunk Telegram user-id ACL, admin tools (grant / revoke / show access), and `@username` resolution via a local user cache. FastEmbed multilingual E5 embeddings.
 user-invocable: true
 metadata:
   openclaw:
@@ -8,7 +8,7 @@ metadata:
     requires:
       bins: ["python"]
       anyBins: []
-      env: ["QDRANT_URL", "QDRANT_API_KEY", "INFERENCE_BASE_URL", "INFERENCE_API_KEY", "INFERENCE_MODEL", "RAG_PHOTOS_DIR"]
+      env: ["QDRANT_URL", "QDRANT_API_KEY", "INFERENCE_BASE_URL", "INFERENCE_API_KEY", "INFERENCE_MODEL", "RAG_PHOTOS_DIR", "ADMIN_TELEGRAM_IDS"]
     primaryEnv: "INFERENCE_API_KEY"
     install:
       - id: pip
@@ -19,13 +19,15 @@ metadata:
 
 # rag-qdrant
 
-A single Qdrant-backed RAG skill. Ingest text, PDF, or Markdown into a configurable Qdrant collection with FastEmbed multilingual E5 embeddings, then ask grounded questions answered by one OpenAI-compatible chat endpoint.
+A single Qdrant-backed RAG skill with per-chunk Telegram user-id ACL. Ingest text, PDF, Markdown, or photos into a configurable Qdrant collection with FastEmbed multilingual E5 embeddings, then ask grounded questions answered by one OpenAI-compatible chat endpoint. Admins can grant / revoke / show access by `@username` or numeric Telegram id (resolved through a local user cache).
 
 The skill has no UI of its own. Use the CLI or import the Python API from an openclaw agent.
 
+> **Install on a dedicated OpenClaw instance.** This skill is intended to run as the user-facing Telegram bot for its intended operator. The dev / test instance is a separate OpenClaw install.
+
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in your Qdrant connection and inference endpoint.
+1. Copy `.env.example` to `.env` and fill in your Qdrant connection and inference endpoint. **Set `ADMIN_TELEGRAM_IDS`** to the comma-separated Telegram user ids of the people who can use the admin tools (required at import time; fail-closed if missing).
 2. Install dependencies:
 
    ```bash
@@ -141,16 +143,18 @@ Public types: `AgentMessage`, `Attachment`, `handle_message`. There are no comma
 
 Every inbound `AgentMessage` (text or attachment) is sent to the inference model with this system prompt (excerpt — full text in `rag_qdrant/prompts.py`):
 
-> You are the routing layer for a small RAG skill. You have two tools and one chat path. You are the only decision-maker.
+> You're an office worker. Slightly grumpy, slightly clipped. Short sentences. No exclamation marks. No "as an AI". No "I'd be happy to help". No "Great question". No "Sure," or "Certainly" or "Of course". No apology, no preamble, no closing line.
 >
-> 1. `store_text(text, source="")` — save `text` into the knowledge base.
-> 2. `ask_corpus(question)` — search the knowledge base and answer `question` grounded in what is found.
+> You have two tools and one chat path. Pick at most one per turn.
 >
-> Chat path (no tool call): greetings, meta-questions, small talk, and clarifications. If intent is ambiguous, prefer a one-line clarification question over a forced tool call.
+> 1. `store_text(text, source="")` — file something in the cabinet.
+> 2. `ask_corpus(question)` — search the cabinet and answer the question from what you find.
 >
-> When you call `ask_corpus`, your visible reply must be the grounded answer only — no `contexts`, scores, sources, chunk indices, or payloads. The system drops those automatically.
+> Chat path (no tool call): greetings, meta-questions, small talk, thanks, follow-up clarifications. One short grumpy sentence. No list. No warmth. "Mm." is a complete answer. "Noted." is a complete answer.
+>
+> When you call `ask_corpus`, your visible reply is the grounded answer only — no contexts, scores, source ids, chunk indices, payloads, or "Based on the context". The system drops all of that automatically.
 
-The two tool schemas (OpenAI-format):
+The two public tool schemas (OpenAI-format):
 
 ```python
 {
@@ -179,10 +183,20 @@ The two tool schemas (OpenAI-format):
 | LLM decision | Handler action | Reply to the user |
 | --- | --- | --- |
 | `store_text(text)` | `ingest_text(text, source="auto-<sha1(text[:40])[:12]>")` (or the explicit `source` the LLM passed) | `Ingested N chunks from <source>` |
-| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list |
-| No tool call (plain chat) | pass through | the LLM's reply, verbatim |
+| `ask_corpus(question)` | `ask(question)` (Qdrant search + grounded LLM call, ACL-filtered by caller's Telegram id) | ONLY `result["answer"]` — no score, no source, no chunk_index, no payload, no `contexts` list. If the search returned nothing (ACL-filtered or genuinely absent), the bot replies **"Nothing on that."** — same line for both cases; the filter is never explained. |
+| `grant_access(source, telegram_id)` (admin only) | append `telegram_id` (numeric or `@username`) to every chunk under `source` | `Granted access to <id> for source <source> (N chunk(s) updated).` |
+| `revoke_access(source, telegram_id)` (admin only) | remove `telegram_id` from every chunk under `source` | `Revoked access for <id> from source <source> (N chunk(s) updated).` |
+| `show_access(source)` (admin only) | read ACL + chunk count for `source` | list of ids + chunk count, or `No chunks found for source <source>.` |
+| `resolve_username(username)` (admin only) | look up `@username` in the local user cache | `@<username> (Telegram id <id>, "<first_name>").` or `That user hasn't messaged this bot yet…` if the user has never DM'd the bot. |
+| No tool call (plain chat) | pass through | the LLM's reply, verbatim. Greetings like "hi" get one short grumpy sentence ("Mm."), not "Hello! How can I help you today?" |
 
 If the configured inference endpoint does not support tool calls (or any other API error happens), the wrapper returns a clear error string and the handler returns that string. The handler itself does not raise for routing failures.
+
+### Admin tools
+
+`store_text`, `grant_access`, `revoke_access`, `show_access`, and `resolve_username` are admin-only. A non-admin caller asking for any of them gets `This action is only available to admins. Ask an admin to grant you access or perform the action for you.` — no Qdrant write happens. The LLM cannot bypass the gate; the handler re-checks the caller's role against `ADMIN_TELEGRAM_IDS` after the model decides which tool to call.
+
+`grant_access` and `revoke_access` accept either a numeric Telegram id (`"123"`) or a `@username` (`"@alice"`, `"alice"`). `@username` values are resolved through the local user cache at `RAG_USER_CACHE_PATH` (default `logs/user_cache.json`); the user must have sent the bot at least one direct message before they can be looked up. The cache is auto-populated on every inbound message and stored with mode `0600`. When the username can't be resolved, the bot says `That user hasn't messaged this bot yet. Ask them to send any message to the bot first, then try again.` and skips the Qdrant write.
 
 ### Clarification behavior
 

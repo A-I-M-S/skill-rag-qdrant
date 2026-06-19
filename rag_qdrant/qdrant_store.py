@@ -98,7 +98,13 @@ def _normalize_telegram_id(value: int | str) -> str:
 
 
 def _normalize_allowed_telegram_ids(values: list[int | str] | None) -> list[str] | None:
-    """Normalize a list of telegram ids for storage. Returns ``None`` when input is ``None``."""
+    """Normalize a list of telegram ids for storage.
+
+    Returns ``None`` when the caller passes ``None`` *or* an empty list
+    — both mean "no restriction, public" (per user spec: "if not
+    specified, anyone can access"). The payload field is then omitted
+    at ingest time so legacy chunks with no field are public by default.
+    """
     if values is None:
         return None
     out: list[str] = []
@@ -106,6 +112,8 @@ def _normalize_allowed_telegram_ids(values: list[int | str] | None) -> list[str]
         norm = _normalize_telegram_id(v)
         if norm not in out:
             out.append(norm)
+    if not out:
+        return None
     if WILDCARD_TELEGRAM_ID in out and len(out) > 1:
         out = [WILDCARD_TELEGRAM_ID]
     return out
@@ -114,19 +122,22 @@ def _normalize_allowed_telegram_ids(values: list[int | str] | None) -> list[str]
 def _build_acl_filter(allowed_telegram_id: int | str | None, *, is_admin: bool) -> models.Filter | None:
     """Build the Qdrant payload filter for the access-control list.
 
-    Semantics (per issue #1 + plan Q1):
+    Semantics (per user spec: "if not specified, anyone can access"):
 
     - ``is_admin=True`` → no filter (admins see everything).
-    - non-admin with an id → ``allowed_telegram_ids`` *contains* that
-      id (as a string) OR *contains* the ``"*"`` wildcard.
-    - non-admin with no id (CLI default path) → ``allowed_telegram_ids``
-      *contains* ``"*"`` OR the field is missing (public / legacy
-      chunks). The "field missing" half is expressed as
-      ``is_empty: { key: allowed_telegram_ids }``-style logic: in
-      practice we just OR in the wildcard, which covers explicit
-      public, and rely on the no-field path by not adding a
-      ``must_not exists`` (Qdrant treats a missing field as matching
-      any field-absence predicate).
+    - non-admin with an id → chunk is visible if its
+      ``allowed_telegram_ids`` field is missing/empty (public/legacy),
+      contains that id, or contains the ``"*"`` wildcard.
+    - non-admin with no id (CLI default path) → chunk is visible if
+      its ``allowed_telegram_ids`` field is missing/empty (public/legacy)
+      or contains the ``"*"`` wildcard.
+
+    Note on Qdrant semantics: ``is_empty`` matches both missing fields
+    and empty arrays. Since ``_normalize_allowed_telegram_ids`` collapses
+    ``[]`` to ``None`` (omitted at ingest), and ``revoke_access`` deletes
+    the field when the list becomes empty, in practice
+    ``is_empty`` here means "public/legacy" — never an explicit
+    no-access mode.
     """
     if is_admin:
         return None
@@ -134,14 +145,18 @@ def _build_acl_filter(allowed_telegram_id: int | str | None, *, is_admin: bool) 
         key=ALLOWED_TELEGRAM_IDS_FIELD,
         match=models.MatchValue(value=WILDCARD_TELEGRAM_ID),
     )
+    is_empty_field = models.FieldCondition(
+        key=ALLOWED_TELEGRAM_IDS_FIELD,
+        is_empty=True,
+    )
     if allowed_telegram_id is None:
-        return models.Filter(must=[wildcard])
+        return models.Filter(should=[wildcard, is_empty_field])
     norm = _normalize_telegram_id(allowed_telegram_id)
     user_match = models.FieldCondition(
         key=ALLOWED_TELEGRAM_IDS_FIELD,
         match=models.MatchValue(value=norm),
     )
-    return models.Filter(must=[models.Filter(should=[user_match, wildcard])])
+    return models.Filter(should=[user_match, wildcard, is_empty_field])
 
 
 def ensure_payload_indexes() -> None:
@@ -439,8 +454,10 @@ def grant_access(source: str, telegram_id: int | str) -> dict[str, Any]:
 def revoke_access(source: str, telegram_id: int | str) -> dict[str, Any]:
     """Remove ``telegram_id`` from the ACL of every point with ``source=<source>``.
 
-    If the list becomes empty, the field is left as ``[]`` (explicit
-    no-access). Returns ``{"source": ..., "telegram_id": ...,
+    If the list becomes empty, the field is *deleted* (not left as
+    ``[]``) so the point reverts to public. This keeps Qdrant's
+    ``is_empty`` predicate aligned with "public" rather than as a
+    no-access marker. Returns ``{"source": ..., "telegram_id": ...,
     "updated": N, "removed": N}`` for the LLM to relay.
     """
     ensure_collection()
@@ -472,11 +489,21 @@ def revoke_access(source: str, telegram_id: int | str) -> dict[str, Any]:
             if norm not in current:
                 continue
             new_value = [x for x in current if x != norm]
-            client.set_payload(
-                collection_name=settings.qdrant_collection,
-                payload={ALLOWED_TELEGRAM_IDS_FIELD: new_value},
-                points=[pt.id],
-            )
+            if new_value:
+                client.set_payload(
+                    collection_name=settings.qdrant_collection,
+                    payload={ALLOWED_TELEGRAM_IDS_FIELD: new_value},
+                    points=[pt.id],
+                )
+            else:
+                # List is now empty → delete the field so the point
+                # reverts to public. This keeps is_empty aligned with
+                # "public" and avoids the no-access semantic.
+                client.delete_payload(
+                    collection_name=settings.qdrant_collection,
+                    keys=[ALLOWED_TELEGRAM_IDS_FIELD],
+                    points=[pt.id],
+                )
             updated += 1
             removed += 1
         if next_offset is None:
