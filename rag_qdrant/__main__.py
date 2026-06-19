@@ -12,10 +12,40 @@ from .cache import (
     semantic_cache_clear,
     semantic_cache_stats,
 )
-from .config import settings
+from .config import is_admin, settings
 from .inference import answer_question
 from .logging_setup import logger
-from .qdrant_store import collection_stats, ensure_collection, ingest_file, ingest_text, search
+from .qdrant_store import (
+    collection_stats,
+    ensure_collection,
+    grant_access,
+    ingest_file,
+    ingest_text,
+    revoke_access,
+    search,
+    show_access,
+)
+
+
+def _parse_acl_ids(raw: str | None) -> list[str]:
+    """Parse a comma-separated id list. Empty string → empty list (explicit no-access)."""
+    if raw is None:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _resolve_acl(args: argparse.Namespace) -> list[str] | None:
+    """Convert the CLI's --allowed-telegram-ids / --no-access flags into a payload value.
+
+    Returns ``None`` for public (default), ``[]`` for explicit no-access,
+    or a list of ids for restricted.
+    """
+    if getattr(args, "no_access", False):
+        return []
+    raw = getattr(args, "allowed_telegram_ids", None)
+    if raw is None:
+        return None
+    return _parse_acl_ids(raw)
 
 
 def cmd_init(_args: argparse.Namespace) -> None:
@@ -24,23 +54,54 @@ def cmd_init(_args: argparse.Namespace) -> None:
 
 
 def cmd_ingest_file(args: argparse.Namespace) -> None:
-    count = ingest_file(Path(args.path), source=args.source)
+    count = ingest_file(
+        Path(args.path),
+        source=args.source,
+        allowed_telegram_ids=_resolve_acl(args),
+    )
     print(json.dumps({"ingested_chunks": count}, indent=2))
 
 
 def cmd_ingest_text(args: argparse.Namespace) -> None:
-    count = ingest_text(args.text, source=args.source)
+    count = ingest_text(
+        args.text,
+        source=args.source,
+        allowed_telegram_ids=_resolve_acl(args),
+    )
     print(json.dumps({"ingested_chunks": count}, indent=2))
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    results = search(args.question, top_k=args.top_k)
+    results = search(
+        args.question,
+        top_k=args.top_k,
+        allowed_telegram_id=args.telegram_id,
+        is_admin=is_admin(args.telegram_id) if args.telegram_id is not None else False,
+    )
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 
 def cmd_ask(args: argparse.Namespace) -> None:
-    result = answer_question(args.question)
+    result = answer_question(
+        args.question,
+        current_telegram_id=args.telegram_id,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_grant(args: argparse.Namespace) -> None:
+    result = grant_access(args.source, args.telegram_id)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_revoke(args: argparse.Namespace) -> None:
+    result = revoke_access(args.source, args.telegram_id)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_show_access(args: argparse.Namespace) -> None:
+    result = show_access(args.source)
+    print(json.dumps(result, indent=2))
 
 
 def cmd_stats(_args: argparse.Namespace) -> None:
@@ -97,21 +158,65 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_file_p = sub.add_parser("ingest-file", help="Ingest a PDF/TXT/MD file")
     ingest_file_p.add_argument("path")
     ingest_file_p.add_argument("--source")
+    ingest_file_p.add_argument(
+        "--allowed-telegram-ids",
+        default=None,
+        help="Comma-separated Telegram ids that may read this content. Omit for public.",
+    )
+    ingest_file_p.add_argument(
+        "--no-access",
+        action="store_true",
+        help="Set allowed_telegram_ids to an empty list (admin-only). Overrides --allowed-telegram-ids.",
+    )
     ingest_file_p.set_defaults(func=cmd_ingest_file)
 
     ingest_text_p = sub.add_parser("ingest-text", help="Ingest raw text")
     ingest_text_p.add_argument("text")
     ingest_text_p.add_argument("--source", default="manual-text")
+    ingest_text_p.add_argument(
+        "--allowed-telegram-ids",
+        default=None,
+        help="Comma-separated Telegram ids that may read this content. Omit for public.",
+    )
+    ingest_text_p.add_argument(
+        "--no-access",
+        action="store_true",
+        help="Set allowed_telegram_ids to an empty list (admin-only). Overrides --allowed-telegram-ids.",
+    )
     ingest_text_p.set_defaults(func=cmd_ingest_text)
 
     search_p = sub.add_parser("search", help="Vector search Qdrant (raw contexts, no LLM answer)")
     search_p.add_argument("question")
     search_p.add_argument("--top-k", type=int)
+    search_p.add_argument(
+        "--telegram-id",
+        default=None,
+        help="Telegram id of the searcher. Admins see everything; others see only ACL-matching chunks.",
+    )
     search_p.set_defaults(func=cmd_search)
 
     ask_p = sub.add_parser("ask", help="Search Qdrant and answer through the configured inference model")
     ask_p.add_argument("question")
+    ask_p.add_argument(
+        "--telegram-id",
+        default=None,
+        help="Telegram id of the asker. Admins see everything; others see only ACL-matching chunks.",
+    )
     ask_p.set_defaults(func=cmd_ask)
+
+    grant_p = sub.add_parser("grant-access", help="Add a Telegram id to the ACL of every chunk in a source")
+    grant_p.add_argument("source")
+    grant_p.add_argument("telegram_id")
+    grant_p.set_defaults(func=cmd_grant)
+
+    revoke_p = sub.add_parser("revoke-access", help="Remove a Telegram id from the ACL of every chunk in a source")
+    revoke_p.add_argument("source")
+    revoke_p.add_argument("telegram_id")
+    revoke_p.set_defaults(func=cmd_revoke)
+
+    show_p = sub.add_parser("show-access", help="Show the current ACL and chunk count for a source")
+    show_p.add_argument("source")
+    show_p.set_defaults(func=cmd_show_access)
 
     stats_p = sub.add_parser("stats", help="Show Qdrant collection stats")
     stats_p.set_defaults(func=cmd_stats)

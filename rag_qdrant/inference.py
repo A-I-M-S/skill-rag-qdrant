@@ -8,7 +8,7 @@ from .cache import (
     semantic_cache_lookup,
     semantic_cache_store,
 )
-from .config import settings
+from .config import is_admin, settings
 from .logging_setup import logger
 from .photo_matching import extract_photos
 from .prompts import Action, SYSTEM_PROMPT as _ROUTING_SYSTEM_PROMPT
@@ -41,9 +41,46 @@ def _answer(prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def answer_question(question: str) -> dict:
+def answer_question(
+    question: str,
+    *,
+    current_telegram_id: int | str | None = None,
+    allowed_telegram_id: int | str | None = None,
+    is_admin_override: bool | None = None,
+) -> dict:
+    """Search Qdrant (with the ACL filter) and answer via the configured inference model.
+
+    The ACL parameters mirror :func:`rag_qdrant.qdrant_store.search`:
+
+    - ``current_telegram_id`` is the user who sent the question. If
+      non-``None``, admins (per :func:`rag_qdrant.config.is_admin`) see
+      every chunk; non-admins see only chunks whose ACL matches the
+      id. When ``current_telegram_id`` is ``None`` the behavior is the
+      public default (filter requires the ``"*"`` wildcard; legacy
+      un-ACLed chunks are still returned via Qdrant's missing-field
+      semantics).
+    - ``is_admin_override`` lets a caller (e.g. the CLI) force the
+      admin path without going through :func:`is_admin`.
+    - ``allowed_telegram_id`` is a low-level escape hatch for the
+      same value; if it is provided, it is used directly instead of
+      :func:`is_admin`.
+    """
     settings.require_inference()
-    if settings.semantic_cache_enabled:
+
+    if allowed_telegram_id is None and current_telegram_id is not None:
+        if is_admin_override is not None:
+            admin = bool(is_admin_override)
+        else:
+            admin = is_admin(current_telegram_id)
+        effective_acl_id: int | str | None = None if admin else current_telegram_id
+        effective_admin = admin
+    else:
+        effective_acl_id = allowed_telegram_id
+        effective_admin = bool(is_admin_override) if is_admin_override is not None else False
+
+    user_specific = effective_acl_id is not None and not effective_admin
+
+    if settings.semantic_cache_enabled and not user_specific:
         query_embedding = embed_texts([question], query=True)[0]
         cached = semantic_cache_lookup(question, query_embedding)
         if cached is not None:
@@ -51,12 +88,18 @@ def answer_question(question: str) -> dict:
     else:
         query_embedding = None
 
-    contexts = search(question, top_k=settings.top_k, query_vector=query_embedding)
+    contexts = search(
+        question,
+        top_k=settings.top_k,
+        query_vector=query_embedding,
+        allowed_telegram_id=effective_acl_id,
+        is_admin=effective_admin,
+    )
     contexts = [item for item in contexts if float(item.get("score") or 0) >= settings.min_relevance_score]
     if not contexts:
         logger.info("inference_no_relevant_context question_chars=%s min_relevance_score=%s", len(question), settings.min_relevance_score)
         result = {"answer": NO_RELEVANT_ANSWER, "contexts": [], "photos": []}
-        if settings.semantic_cache_enabled and query_embedding is not None:
+        if settings.semantic_cache_enabled and query_embedding is not None and not user_specific:
             semantic_cache_store(question, query_embedding, result, is_miss=True)
         return result
     prompt = build_prompt(question, contexts)
@@ -73,7 +116,7 @@ def answer_question(question: str) -> dict:
         len(answer),
     )
     result = {"answer": answer, "contexts": contexts, "photos": extract_photos(contexts)}
-    if settings.semantic_cache_enabled and query_embedding is not None:
+    if settings.semantic_cache_enabled and query_embedding is not None and not user_specific:
         semantic_cache_store(question, query_embedding, result, is_miss=False)
     return result
 

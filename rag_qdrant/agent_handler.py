@@ -73,16 +73,31 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .config import is_admin
 from .inference import ask, classify_and_route
 from .photo_store import Photo, save_photo
-from .prompts import SYSTEM_PROMPT, TOOLS
-from .qdrant_store import ingest_file, ingest_photo, ingest_text
+from .prompts import SYSTEM_PROMPT, TOOLS, TOOLS_WITH_ADMIN
+from .qdrant_store import (
+    grant_access as qdrant_grant_access,
+    ingest_file,
+    ingest_photo,
+    ingest_text,
+    revoke_access as qdrant_revoke_access,
+    show_access as qdrant_show_access,
+)
 
 SUPPORTED_ATTACHMENT_SUFFIXES = frozenset({'.pdf', '.txt', '.md', '.text'})
 
 TEXT_PREFIX_LEN = 40
 SOURCE_HASH_LEN = 12
 SOURCE_NAMESPACE = 'auto'
+
+ADMIN_ONLY_MESSAGE = (
+    "This action is only available to admins. Ask an admin to grant you access "
+    "or perform the action for you."
+)
+
+TOOL_NAMES_REQUIRING_ADMIN = frozenset({"store_text", "grant_access", "revoke_access", "show_access"})
 
 
 @dataclass(frozen=True)
@@ -114,11 +129,17 @@ class AgentMessage:
             photo's bytes are saved to
             :data:`rag_qdrant.config.settings.photos_dir` and its
             description is embedded in the corpus.
+        current_telegram_id: Optional Telegram user id of the sender.
+            When set, the handler uses it to decide admin status (via
+            :func:`rag_qdrant.config.is_admin`) and to apply the
+            access-control filter to ``ask_corpus`` lookups. ``None``
+            is treated as a non-admin public caller.
     """
 
     text: str
     attachments: tuple[Attachment, ...] = ()
     photos: tuple[Photo, ...] = ()
+    current_telegram_id: int | str | None = None
 
 
 @dataclass(frozen=True)
@@ -240,11 +261,19 @@ def handle_message(message: AgentMessage) -> AgentReply:
     validation inside :func:`save_photo` (empty description, bad
     suffix).
 
-    The ``ask_corpus`` branch returns ``AgentReply(text=answer,
-    photo_paths=tuple(p["path"] for p in result["photos"]))``. Score,
-    source, chunk_index, payload, and the contexts list are
-    deliberately not included in the reply text — only the answer
-    string and the matched photo paths.
+    Admin gating: when the LLM is called with the standard
+    :data:`TOOLS` schema (admins only), the LLM may invoke
+    ``store_text``, ``grant_access``, ``revoke_access``, or
+    ``show_access``. When the LLM is called with the read-only
+    :data:`TOOLS_PUBLIC` schema (everyone), the LLM only sees
+    ``ask_corpus``. The gate is enforced server-side: the LLM's tool
+    choice is re-checked against the caller's admin status and
+    non-admin calls return :data:`ADMIN_ONLY_MESSAGE` without
+    touching Qdrant.
+
+    The ``ask_corpus`` branch forwards the caller's
+    ``current_telegram_id`` into the search filter so non-admins see
+    only the chunks their ACL allows. Admins see every chunk.
     """
     attachment_notice_lines: list[str] = _ingest_attachments(message.attachments)
     photo_notice_lines, saved_photo_paths = _ingest_photos(message.photos)
@@ -255,12 +284,23 @@ def handle_message(message: AgentMessage) -> AgentReply:
         return AgentReply(text=ingest_notice, photo_paths=tuple(saved_photo_paths))
 
     llm_user_text = f"{ingest_notice}\n\n{body}" if ingest_notice else body
+    caller_is_admin = is_admin(message.current_telegram_id)
+    tool_schema = TOOLS_WITH_ADMIN if caller_is_admin else TOOLS
+    system_prompt = SYSTEM_PROMPT
+
     action, payload = classify_and_route(
         llm_user_text,
         attachment_notice='',
-        system_prompt=SYSTEM_PROMPT,
-        tools=TOOLS,
+        system_prompt=system_prompt,
+        tools=tool_schema,
     )
+
+    if action in TOOL_NAMES_REQUIRING_ADMIN:
+        if not caller_is_admin:
+            return AgentReply(text=ADMIN_ONLY_MESSAGE, photo_paths=())
+    else:
+        # Public tools (ask_corpus) and the chat path: still permitted.
+        pass
 
     if action == 'store_text':
         try:
@@ -284,6 +324,83 @@ def handle_message(message: AgentMessage) -> AgentReply:
             photo_paths=(),
         )
 
+    if action == 'grant_access':
+        try:
+            parsed = json.loads(payload)
+            source = (parsed.get('source') or '').strip()
+            tid = parsed.get('telegram_id')
+        except (TypeError, ValueError):
+            return AgentReply(
+                text='Error: malformed grant_access payload from the routing LLM.',
+                photo_paths=(),
+            )
+        if not source or tid is None:
+            return AgentReply(
+                text='Error: grant_access requires non-empty source and telegram_id.',
+                photo_paths=(),
+            )
+        result = qdrant_grant_access(source, tid)
+        return AgentReply(
+            text=f'Granted access to {result["telegram_id"]} for source {result["source"]} '
+                 f'({result["updated"]} chunk(s) updated).',
+            photo_paths=(),
+        )
+
+    if action == 'revoke_access':
+        try:
+            parsed = json.loads(payload)
+            source = (parsed.get('source') or '').strip()
+            tid = parsed.get('telegram_id')
+        except (TypeError, ValueError):
+            return AgentReply(
+                text='Error: malformed revoke_access payload from the routing LLM.',
+                photo_paths=(),
+            )
+        if not source or tid is None:
+            return AgentReply(
+                text='Error: revoke_access requires non-empty source and telegram_id.',
+                photo_paths=(),
+            )
+        result = qdrant_revoke_access(source, tid)
+        return AgentReply(
+            text=f'Revoked access for {result["telegram_id"]} from source {result["source"]} '
+                 f'({result["removed"]} chunk(s) updated).',
+            photo_paths=(),
+        )
+
+    if action == 'show_access':
+        try:
+            parsed = json.loads(payload)
+            source = (parsed.get('source') or '').strip()
+        except (TypeError, ValueError):
+            return AgentReply(
+                text='Error: malformed show_access payload from the routing LLM.',
+                photo_paths=(),
+            )
+        if not source:
+            return AgentReply(
+                text='Error: show_access requires a non-empty source.',
+                photo_paths=(),
+            )
+        result = qdrant_show_access(source)
+        if result['chunk_count'] == 0:
+            return AgentReply(
+                text=f'No chunks found for source {result["source"]}.',
+                photo_paths=(),
+            )
+        ids = result['allowed_telegram_ids'] or []
+        if not ids:
+            return AgentReply(
+                text=f'Source {result["source"]} has {result["chunk_count"]} chunk(s); '
+                     f'no Telegram id is granted access (admin-only).',
+                photo_paths=(),
+            )
+        return AgentReply(
+            text=f'Source {result["source"]} has {result["chunk_count"]} chunk(s); '
+                 f'allowed Telegram ids: {", ".join(ids)}.',
+            photo_paths=(),
+        )
+
     if action == 'ask_corpus':
         question = (payload or '').strip()
         if not question:
@@ -291,7 +408,7 @@ def handle_message(message: AgentMessage) -> AgentReply:
                 text='Error: ask_corpus was called with an empty question.',
                 photo_paths=(),
             )
-        result = ask(question)
+        result = ask(question, current_telegram_id=message.current_telegram_id)
         matched = [p.get('path') for p in result.get('photos', []) if p.get('path')]
         return AgentReply(
             text=result['answer'],
@@ -302,10 +419,12 @@ def handle_message(message: AgentMessage) -> AgentReply:
 
 
 __all__ = [
+    'ADMIN_ONLY_MESSAGE',
     'AgentMessage',
     'AgentReply',
     'Attachment',
     'Photo',
     'SUPPORTED_ATTACHMENT_SUFFIXES',
     'handle_message',
+    'is_admin',
 ]

@@ -27,6 +27,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Required by rag_qdrant.config: ADMIN_TELEGRAM_IDS is fail-closed at
+# import time. Set a stable default for the offline test environment;
+# individual tests may reload the config with different values to
+# exercise the fail-closed path.
+os.environ.setdefault("ADMIN_TELEGRAM_IDS", "920567169,111,222")
+
 import types  # noqa: E402
 
 
@@ -62,7 +68,51 @@ sys.modules["qdrant_client.http.models"].PayloadSchemaType = types.SimpleNamespa
 sys.modules["qdrant_client.http.models"].VectorParams = lambda **kw: ("VectorParams", kw)
 sys.modules["qdrant_client.http.models"].Distance = types.SimpleNamespace(COSINE="Cosine")
 sys.modules["qdrant_client.http.models"].PointStruct = lambda **kw: ("PointStruct", kw)
+
+
+class _StubFieldCondition:
+    def __init__(self, key: str, match: object) -> None:
+        self.key = key
+        self.match = match
+
+
+class _StubMatchValue:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+class _StubFilter:
+    """Mimics ``qdrant_client.http.models.Filter`` shape for ACL tests."""
+
+    def __init__(self, must: list[object] | None = None, should: list[object] | None = None) -> None:
+        self.must = list(must or [])
+        self.should = list(should or [])
+
+
+sys.modules["qdrant_client.http.models"].FieldCondition = _StubFieldCondition
+sys.modules["qdrant_client.http.models"].MatchValue = _StubMatchValue
+sys.modules["qdrant_client.http.models"].Filter = _StubFilter
 sys.modules["qdrant_client"].QdrantClient = type("QdrantClient", (), {})
+
+
+class _StubOpenAI:
+    """Stub for ``openai.OpenAI`` that swallows init kwargs."""
+
+    def __init__(self, *args, **kwargs):
+        self._init_kwargs = kwargs
+
+        class _Chat:
+            class _Completions:
+                def create(self, **_kw):
+                    raise RuntimeError("openai.OpenAI is stubbed; use patch.object")
+
+            def __init__(self):
+                self.completions = _StubOpenAI._Chat._Completions()
+
+        self.chat = _Chat()
+
+
+sys.modules["openai"].OpenAI = _StubOpenAI
 sys.modules["fastembed"].TextEmbedding = type(
     "TextEmbedding",
     (),
@@ -242,14 +292,35 @@ def run_config_tests() -> None:
 def run_qdrant_store_tests() -> None:
     src = inspect.getsource(qdrant_store_module)
 
-    # No telegram_user_id index
+    # No telegram_user_id index (legacy field name)
     expect(
         "qdrant_store_no_telegram_user_id_index",
         "telegram_user_id" not in src,
     )
+    # Identifier-shaped "telegram*" tokens outside the new schema
+    # are stragglers from the old telegram-bot integration.
+    leftover = _find_telegram_stragglers(src)
     expect(
-        "qdrant_store_no_telegram_metadata",
-        "telegram_" not in src,
+        "qdrant_store_no_telegram_stragglers",
+        not leftover,
+        f"raw 'telegram*' identifier tokens outside the new schema: {leftover}",
+    )
+    # New schema tokens must be present
+    expect(
+        "qdrant_store_has_allowed_telegram_ids_field",
+        "ALLOWED_TELEGRAM_IDS_FIELD" in src,
+    )
+    expect(
+        "qdrant_store_has_grant_access",
+        "def grant_access(" in src,
+    )
+    expect(
+        "qdrant_store_has_revoke_access",
+        "def revoke_access(" in src,
+    )
+    expect(
+        "qdrant_store_has_show_access",
+        "def show_access(" in src,
     )
 
     # Public API exists
@@ -263,6 +334,9 @@ def run_qdrant_store_tests() -> None:
         "collection_stats",
         "embed_texts",
         "get_qdrant_client",
+        "grant_access",
+        "revoke_access",
+        "show_access",
     ):
         expect(f"qdrant_store_public_{name}", hasattr(qdrant_store_module, name))
 
@@ -272,6 +346,7 @@ def run_qdrant_store_tests() -> None:
     expect("qdrant_store_indexes_file_name", '"file_name"' in src_lines)
     expect("qdrant_store_indexes_file_type", '"file_type"' in src_lines)
     expect("qdrant_store_indexes_kind", '"kind"' in src_lines)
+    expect("qdrant_store_indexes_allowed_telegram_ids", '"allowed_telegram_ids"' in src_lines)
     expect("qdrant_store_uses_cosine_distance", "models.Distance.COSINE" in src_lines)
 
     # custom FastEmbed model registration still present
@@ -358,7 +433,10 @@ def run_inference_module_tests() -> None:
     expect("inference_uses_settings_inference_model", "settings.inference_model" in src)
     expect("inference_uses_settings_min_relevance_score", "min_relevance_score" in src)
 
-    # No straggler providers
+    # No straggler providers. The ACL plumbing uses
+    # ``current_telegram_id`` / ``allowed_telegram_id`` /
+    # ``is_admin``; raw ``telegram`` (outside the schema) is
+    # forbidden.
     for forbidden in (
         "_answer_with_zo_ask",
         "zo_ask",
@@ -370,9 +448,17 @@ def run_inference_module_tests() -> None:
         "OPENROUTER_MODEL",
         "OPENROUTER_PROVIDER",
         "INFERENCE_PROVIDER",
-        "telegram",
     ):
         expect(f"inference_no_{forbidden}", forbidden not in src)
+
+    # Identifier-shaped "telegram*" tokens outside the new schema
+    # are stragglers.
+    leftover = _find_telegram_stragglers(src)
+    expect(
+        "inference_no_telegram_stragglers",
+        not leftover,
+        f"raw 'telegram*' identifier tokens outside the new schema: {leftover}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +485,13 @@ def run_public_api_tests() -> None:
         "semantic_cache_clear",
         "search_cache_stats",
         "search_cache_clear",
+        "grant_access",
+        "revoke_access",
+        "show_access",
+        "is_admin",
+        "admin_telegram_ids",
+        "ALLOWED_TELEGRAM_IDS_FIELD",
+        "WILDCARD_TELEGRAM_ID",
         "__version__",
     ):
         expect(f"public_api_exports_{name}", hasattr(rag_qdrant, name))
@@ -417,6 +510,9 @@ def run_public_api_tests() -> None:
         "semantic_cache_clear",
         "search_cache_stats",
         "search_cache_clear",
+        "grant_access",
+        "revoke_access",
+        "show_access",
     ):
         expect(f"rag_method_exists_{method}", callable(getattr(RAG, method, None)))
 
@@ -490,8 +586,64 @@ def run_cli_tests() -> None:
     except SystemExit:
         expect("cli_drops_run_bot", True)
 
+    # New ACL subcommands parse cleanly
+    for sub in ("grant-access", "revoke-access", "show-access"):
+        try:
+            args = parser.parse_args([sub, "x", "y" if sub != "show-access" else ""][:2] + ([] if sub == "show-access" else ["y"]))
+            expect(f"cli_parses_{sub}", args.command == sub)
+        except SystemExit:
+            expect(f"cli_parses_{sub}", False, "parser failed")
+    # show-access only needs one arg
+    try:
+        args = parser.parse_args(["show-access", "x"])
+        expect("cli_parses_show_access_one_arg", args.command == "show-access" and args.source == "x")
+    except SystemExit:
+        expect("cli_parses_show_access_one_arg", False, "parser failed")
+
+    # ingest-text / ingest-file accept --allowed-telegram-ids and --no-access
+    try:
+        args = parser.parse_args(["ingest-text", "x", "--allowed-telegram-ids", "123,456"])
+        expect("cli_ingest_text_allowed_ids", args.allowed_telegram_ids == "123,456")
+        expect("cli_ingest_text_no_access_default_false", args.no_access is False)
+    except SystemExit:
+        expect("cli_ingest_text_allowed_ids", False, "parser failed")
+    try:
+        args = parser.parse_args(["ingest-text", "x", "--no-access"])
+        expect("cli_ingest_text_no_access_flag", args.no_access is True)
+    except SystemExit:
+        expect("cli_ingest_text_no_access_flag", False, "parser failed")
+    try:
+        args = parser.parse_args(["ingest-file", "/tmp/x", "--no-access"])
+        expect("cli_ingest_file_no_access_flag", args.no_access is True)
+    except SystemExit:
+        expect("cli_ingest_file_no_access_flag", False, "parser failed")
+
+    # search / ask accept --telegram-id
+    try:
+        args = parser.parse_args(["search", "q", "--telegram-id", "123"])
+        expect("cli_search_telegram_id", args.telegram_id == "123")
+    except SystemExit:
+        expect("cli_search_telegram_id", False, "parser failed")
+    try:
+        args = parser.parse_args(["ask", "q", "--telegram-id", "456"])
+        expect("cli_ask_telegram_id", args.telegram_id == "456")
+    except SystemExit:
+        expect("cli_ask_telegram_id", False, "parser failed")
+
     # __main__ exposes main()
     expect("cli_has_main", callable(getattr(cli_module, "main", None)))
+
+    # _resolve_acl: None / "" / comma-list / --no-access
+    from rag_qdrant.__main__ import _resolve_acl
+    import argparse as _ap
+
+    def _ns(**kwargs):
+        return _ap.Namespace(**kwargs)
+
+    expect("cli_resolve_acl_none", _resolve_acl(_ns(allowed_telegram_ids=None, no_access=False)) is None)
+    expect("cli_resolve_acl_empty_string", _resolve_acl(_ns(allowed_telegram_ids="", no_access=False)) == [])
+    expect("cli_resolve_acl_list", _resolve_acl(_ns(allowed_telegram_ids="123,456", no_access=False)) == ["123", "456"])
+    expect("cli_resolve_acl_no_access_overrides", _resolve_acl(_ns(allowed_telegram_ids="123", no_access=True)) == [])
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +679,55 @@ FORBIDDEN_PATTERNS = (
     "python-telegram-bot",
 )
 
+# Tokens that legitimize a "telegram" mention in source code (the
+# new ACL schema). Strip these before checking for raw leftover
+# "telegram" tokens.
+TELEGRAM_ALLOWED_TOKENS = (
+    "allowed_telegram_ids",
+    "allowed_telegram_id",
+    "admin_telegram_ids",
+    "current_telegram_id",
+    "is_admin",
+    "is_admin_override",
+    "telegram_id",
+    "ALLOWED_TELEGRAM_IDS_FIELD",
+    "WILDCARD_TELEGRAM_ID",
+    "ADMIN_TELEGRAM_IDS",
+    "ADMIN_ONLY_MESSAGE",
+    "TOOLS_WITH_ADMIN",
+    "TOOLS_PUBLIC",
+    "ADMIN_TOOLS",
+    "ADMIN_TELEGRAM_IDS",
+)
+
+# Identifier-shaped tokens (snake_case / camelCase) starting with
+# ``telegram`` are stragglers from the old telegram-bot integration.
+# Bare word "Telegram" in prose is allowed. The pattern requires at
+# least one snake/camel-join character after ``telegram`` (i.e.
+# ``telegram_xxx`` or ``TelegramXxx``), not just the bare word.
+TELEGRAM_STRAGGLER_RE = re.compile(
+    r"\btelegram[a-z][a-z0-9_]*|\bTelegram[A-Z][A-Za-z0-9]*\b",
+)
+
+
+def _strip_telegram_schema_tokens(text: str) -> str:
+    sanitized = text
+    for tok in TELEGRAM_ALLOWED_TOKENS:
+        sanitized = sanitized.replace(tok, "")
+    return sanitized
+
+
+def _find_telegram_stragglers(text: str) -> list[str]:
+    """Return raw ``telegram*`` identifier tokens that are not part of the new schema.
+
+    The regex matches whole-word identifiers like ``telegram_user_id``,
+    ``telegram_bot_token``, ``TelegramBot``, etc. Identifier-shaped
+    tokens that happen to be part of the new schema (e.g.
+    ``allowed_telegram_ids``) are stripped first.
+    """
+    sanitized = _strip_telegram_schema_tokens(text)
+    return TELEGRAM_STRAGGLER_RE.findall(sanitized)
+
 
 def run_repo_grep_tests() -> None:
     targets = []
@@ -553,6 +754,24 @@ def run_repo_grep_tests() -> None:
             else:
                 expect(f"grep_{path.name}_no_{pat}", True)
 
+        # Raw "telegram*" identifier tokens are forbidden anywhere
+        # outside the new schema. The regex is identifier-shaped so
+        # user-facing prose ("the Telegram bot module") is fine; only
+        # leftover variable/function names (``telegram_user_id``,
+        # ``TelegramBot``) are caught. .env / .example files are also
+        # checked: any TELEGRAM_* env var that is not ADMIN_TELEGRAM_IDS
+        # is a straggler.
+        rel = str(path.relative_to(ROOT))
+        leftovers = _find_telegram_stragglers(text)
+        if leftovers:
+            expect(
+                f"grep_{path.name}_no_telegram_stragglers",
+                False,
+                f"raw 'telegram*' identifier tokens in {rel}: {leftovers[:5]}{'…' if len(leftovers) > 5 else ''}",
+            )
+        else:
+            expect(f"grep_{path.name}_no_telegram_stragglers", True)
+
 
 def main() -> int:
     print("== config tests ==")
@@ -569,6 +788,10 @@ def main() -> int:
     run_cli_tests()
     print("\n== cache tests ==")
     run_cache_tests()
+    print("\n== acl tests ==")
+    run_acl_tests()
+    print("\n== admin gate tests ==")
+    run_admin_gate_tests()
     print("\n== repo grep tests ==")
     run_repo_grep_tests()
     print("\n== agent handler tests ==")
@@ -884,6 +1107,453 @@ def run_cache_tests() -> None:
             inference_api_key="",
             inference_model="",
         ))
+
+
+# ---------------------------------------------------------------------------
+# ACL tests (issue #1)
+# ---------------------------------------------------------------------------
+
+
+def _capture_payload_points() -> list[dict[str, Any]]:
+    """Return a list of dicts capturing every PointStruct passed to upsert()."""
+    captured: list[dict[str, Any]] = []
+
+    def _capture_upsert(**kwargs: Any) -> None:
+        for point in kwargs.get("points", []):
+            # PointStruct is a SimpleNamespace from the stub; (name, kw) tuple form
+            if isinstance(point, tuple) and len(point) == 2 and point[0] == "PointStruct":
+                captured.append(point[1])
+            elif hasattr(point, "payload"):
+                captured.append({"id": point.id, "payload": point.payload})
+            else:
+                captured.append({"raw": point})
+
+    return captured, _capture_upsert
+
+
+def run_acl_tests() -> None:
+    """Cover the ACL data model + filter + payload index (issue #1)."""
+    from rag_qdrant.qdrant_store import (
+        ALLOWED_TELEGRAM_IDS_FIELD,
+        WILDCARD_TELEGRAM_ID,
+        _build_acl_filter,
+        _normalize_allowed_telegram_ids,
+        _normalize_telegram_id,
+        grant_access,
+        ingest_text,
+        revoke_access,
+        show_access,
+    )
+
+    # --- ID normalization (Q1) ---
+    expect("acl_normalize_int_to_str", _normalize_telegram_id(123) == "123")
+    expect("acl_normalize_str_int", _normalize_telegram_id("123") == "123")
+    expect("acl_normalize_wildcard", _normalize_telegram_id("*") == "*")
+    expect("acl_normalize_already_str_int", _normalize_telegram_id("456") == "456")
+    expect("acl_normalize_strip_whitespace", _normalize_telegram_id(" 789 ") == "789")
+    expect("acl_normalize_non_numeric_str_passthrough", _normalize_telegram_id("alice") == "alice")
+    expect("acl_normalize_bool_to_str", _normalize_telegram_id(True) == "True")
+
+    # --- List normalization (None → None, [] → [], dedup, normalize) ---
+    expect("acl_normalize_list_none", _normalize_allowed_telegram_ids(None) is None)
+    expect("acl_normalize_list_empty", _normalize_allowed_telegram_ids([]) == [])
+    expect("acl_normalize_list_mixed", _normalize_allowed_telegram_ids([123, "456", 123]) == ["123", "456"])
+    expect("acl_normalize_list_wildcard_solo", _normalize_allowed_telegram_ids(["*", 123]) == ["*"])
+    expect("acl_normalize_list_wildcard_only", _normalize_allowed_telegram_ids(["*"]) == ["*"])
+    expect("acl_normalize_list_dedupes", _normalize_allowed_telegram_ids([123, 123, "123"]) == ["123"])
+
+    # --- ACL filter shape ---
+    flt_admin = _build_acl_filter(None, is_admin=True)
+    expect("acl_filter_admin_returns_None", flt_admin is None)
+
+    flt_no_id = _build_acl_filter(None, is_admin=False)
+    expect("acl_filter_no_id_returns_filter", flt_no_id is not None)
+    # The no-id filter should be a Filter with one must clause
+    expect("acl_filter_no_id_has_must_clause", len(flt_no_id.must) == 1)
+    # that one must clause references the wildcard
+    expect(
+        "acl_filter_no_id_clause_is_wildcard_match",
+        flt_no_id.must[0].key == ALLOWED_TELEGRAM_IDS_FIELD
+        and flt_no_id.must[0].match.value == WILDCARD_TELEGRAM_ID,
+    )
+
+    flt_id = _build_acl_filter(123, is_admin=False)
+    expect("acl_filter_with_id_returns_filter", flt_id is not None)
+    # Should be a Filter(must=[Filter(should=[user_match, wildcard])])
+    expect("acl_filter_with_id_has_outer_must", len(flt_id.must) == 1)
+    inner = flt_id.must[0]
+    expect("acl_filter_with_id_inner_is_should", hasattr(inner, "should") and len(inner.should) == 2)
+    keys = sorted([c.key for c in inner.should])
+    expect("acl_filter_with_id_inner_keys_both_acl", keys == [ALLOWED_TELEGRAM_IDS_FIELD, ALLOWED_TELEGRAM_IDS_FIELD])
+    values = sorted([c.match.value for c in inner.should])
+    expect("acl_filter_with_id_values_user_and_wildcard", values == [WILDCARD_TELEGRAM_ID, "123"])
+
+    # String id should normalize to its int form
+    flt_str = _build_acl_filter("123", is_admin=False)
+    expect("acl_filter_string_id_normalizes_to_str_int", flt_str.must[0].should[0].match.value == "123")
+
+    # --- Ingest behavior: payload includes / excludes the field correctly ---
+    captured, _capture_upsert = _capture_payload_points()
+
+    # Case 1: no allowed_telegram_ids → field omitted
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client") as m_client:
+        fake_client = types.SimpleNamespace(upsert=_capture_upsert)
+        m_client.return_value = fake_client
+        ingest_text("hello", source="acl-x")
+    expect("acl_ingest_none_omits_field", all(ALLOWED_TELEGRAM_IDS_FIELD not in c["payload"] for c in captured))
+    captured.clear()
+
+    # Case 2: explicit list of ids
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client") as m_client:
+        fake_client = types.SimpleNamespace(upsert=_capture_upsert)
+        m_client.return_value = fake_client
+        ingest_text("hello", source="acl-y", allowed_telegram_ids=[123])
+    expect("acl_ingest_int_id_normalized", all(c["payload"].get(ALLOWED_TELEGRAM_IDS_FIELD) == ["123"] for c in captured))
+    captured.clear()
+
+    # Case 3: explicit empty list (no-access)
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client") as m_client:
+        fake_client = types.SimpleNamespace(upsert=_capture_upsert)
+        m_client.return_value = fake_client
+        ingest_text("hello", source="acl-z", allowed_telegram_ids=[])
+    expect("acl_ingest_empty_list_is_empty_field", all(c["payload"].get(ALLOWED_TELEGRAM_IDS_FIELD) == [] for c in captured))
+    captured.clear()
+
+    # Case 4: int values are normalized to str
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client") as m_client:
+        fake_client = types.SimpleNamespace(upsert=_capture_upsert)
+        m_client.return_value = fake_client
+        ingest_text("hello", source="acl-mix", allowed_telegram_ids=[123, "456"])
+    expect("acl_ingest_mixed_ids_normalized", all(c["payload"].get(ALLOWED_TELEGRAM_IDS_FIELD) == ["123", "456"] for c in captured))
+
+    # --- ensure_payload_indexes includes the ACL field ---
+    index_calls: list[tuple[str, str]] = []
+    fake_client = types.SimpleNamespace(
+        create_payload_index=lambda **kw: index_calls.append((kw.get("field_name"), kw.get("field_schema"))),
+    )
+    with patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake_client):
+        qdrant_store_module.ensure_payload_indexes()
+    acl_index_calls = [c for c in index_calls if c[0] == ALLOWED_TELEGRAM_IDS_FIELD]
+    expect("acl_payload_index_created", len(acl_index_calls) == 1)
+    expect("acl_payload_index_is_keyword", acl_index_calls[0][1] == "keyword")
+
+    # --- grant_access behavior ---
+    class _FakePoint:
+        def __init__(self, pid: str, payload: dict[str, Any]) -> None:
+            self.id = pid
+            self.payload = payload
+
+    class _FakeQdrant:
+        def __init__(self) -> None:
+            self.points: dict[str, _FakePoint] = {}
+            self.set_payload_calls: list[tuple[list[str], dict[str, Any]]] = []
+
+        def upsert(self, **_kw: Any) -> None:
+            pass
+
+        def scroll(self, **_kw: Any) -> tuple[list[_FakePoint], None]:
+            return list(self.points.values()), None
+
+        def set_payload(self, **_kw: Any) -> None:
+            points = _kw.get("points", [])
+            payload = _kw.get("payload", {})
+            self.set_payload_calls.append((list(points), dict(payload)))
+            for pid in points:
+                pt = self.points.get(pid)
+                if pt is not None:
+                    for k, v in payload.items():
+                        pt.payload[k] = v
+
+    fake = _FakeQdrant()
+    fake.points["p1"] = _FakePoint("p1", {"source": "src", "text": "t1"})
+    fake.points["p2"] = _FakePoint("p2", {"source": "src", "text": "t2", ALLOWED_TELEGRAM_IDS_FIELD: ["99"]})
+
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake):
+        result = grant_access("src", 123)
+    expect("acl_grant_returns_dict", isinstance(result, dict))
+    expect("acl_grant_updated_count", result["updated"] == 2)
+    expect("acl_grant_p1_now_has_123", "123" in fake.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD])
+    expect("acl_grant_p2_kept_99_and_added_123", sorted(fake.points["p2"].payload[ALLOWED_TELEGRAM_IDS_FIELD]) == ["123", "99"])
+
+    # --- grant_access wildcard replaces ---
+    fake2 = _FakeQdrant()
+    fake2.points["p1"] = _FakePoint("p1", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["123", "456"]})
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake2):
+        grant_access("src", "*")
+    expect("acl_grant_wildcard_replaces", fake2.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD] == ["*"])
+
+    # --- revoke_access behavior ---
+    fake3 = _FakeQdrant()
+    fake3.points["p1"] = _FakePoint("p1", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["123", "456"]})
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake3):
+        result = revoke_access("src", 123)
+    expect("acl_revoke_returns_dict", isinstance(result, dict))
+    expect("acl_revoke_removed_count", result["removed"] == 1)
+    expect("acl_revoke_p1_now_456_only", fake3.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD] == ["456"])
+
+    # --- revoke_access leaving empty list ---
+    fake4 = _FakeQdrant()
+    fake4.points["p1"] = _FakePoint("p1", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["123"]})
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake4):
+        revoke_access("src", 123)
+    expect("acl_revoke_empty_list_left_as_empty", fake4.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD] == [])
+
+    # --- show_access behavior ---
+    fake5 = _FakeQdrant()
+    fake5.points["p1"] = _FakePoint("p1", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["123", "456"]})
+    fake5.points["p2"] = _FakePoint("p2", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["789"]})
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake5):
+        result = show_access("src")
+    expect("acl_show_chunk_count", result["chunk_count"] == 2)
+    expect("acl_show_first_payload_value", result["allowed_telegram_ids"] == ["123", "456"])
+
+    # show_access with no chunks
+    fake6 = _FakeQdrant()
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake6):
+        result = show_access("missing")
+    expect("acl_show_no_chunks_returns_zero", result["chunk_count"] == 0)
+    expect("acl_show_no_chunks_returns_empty_list", result["allowed_telegram_ids"] == [])
+
+    # --- Search passes the filter through to the client (mocked) ---
+    from rag_qdrant.qdrant_store import search
+
+    class _Hit:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.score = 0.9
+            self.id = "1"
+            self.payload = payload
+
+    class _QueryPointsResp:
+        def __init__(self, points: list[_Hit]) -> None:
+            self.points = points
+
+    class _FakeQdrantClient:
+        def __init__(self, response: _QueryPointsResp) -> None:
+            self._response = response
+            self.last_query_filter = None
+
+        def query_points(self, **_kw: Any) -> _QueryPointsResp:
+            self.last_query_filter = _kw.get("query_filter")
+            return self._response
+
+    public_hit = _Hit({"text": "t", "source": "s"})
+    fake_client = _FakeQdrantClient(_QueryPointsResp([public_hit]))
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake_client):
+        # Admin → no filter
+        search("q", allowed_telegram_id=920567169, is_admin=True)
+    expect("acl_search_admin_no_filter", fake_client.last_query_filter is None)
+
+    fake_client = _FakeQdrantClient(_QueryPointsResp([public_hit]))
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake_client):
+        # Non-admin with id → filter
+        search("q", allowed_telegram_id=123, is_admin=False)
+    expect("acl_search_nonadmin_with_id_has_filter", fake_client.last_query_filter is not None)
+    expect(
+        "acl_search_nonadmin_with_id_filter_uses_user_id",
+        any(
+            getattr(c, "key", None) == ALLOWED_TELEGRAM_IDS_FIELD
+            and getattr(getattr(c, "match", None), "value", None) == "123"
+            for c in (fake_client.last_query_filter.must[0].should
+                      if fake_client.last_query_filter.must[0].should
+                      else [fake_client.last_query_filter.must[0]])
+        ),
+    )
+
+    fake_client = _FakeQdrantClient(_QueryPointsResp([public_hit]))
+    with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
+         patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
+         patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake_client):
+        # Non-admin no id → wildcard only
+        search("q", allowed_telegram_id=None, is_admin=False)
+    expect("acl_search_no_id_has_filter", fake_client.last_query_filter is not None)
+    expect(
+        "acl_search_no_id_filter_is_wildcard",
+        any(
+            getattr(c, "match", None) is not None
+            and getattr(c.match, "value", None) == WILDCARD_TELEGRAM_ID
+            for c in fake_client.last_query_filter.must
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin gate tests (issue #3)
+# ---------------------------------------------------------------------------
+
+
+def run_admin_gate_tests() -> None:
+    """Cover the admin role gate, fail-closed config, and cache bypass."""
+    import rag_qdrant.config as cfg
+
+    # is_admin semantics
+    expect("is_admin_known_int", cfg.is_admin(920567169) is True)
+    expect("is_admin_known_str", cfg.is_admin("920567169") is True)
+    expect("is_admin_unknown_int", cfg.is_admin(999) is False)
+    expect("is_admin_none", cfg.is_admin(None) is False)
+    expect("is_admin_unknown_str", cfg.is_admin("not-an-int") is False)
+    expect("is_admin_empty_str", cfg.is_admin("") is False)
+
+    # admin_telegram_ids is a tuple of ints, frozen
+    expect("admin_telegram_ids_is_tuple", isinstance(cfg.admin_telegram_ids, tuple))
+    expect("admin_telegram_ids_all_ints", all(isinstance(x, int) for x in cfg.admin_telegram_ids))
+    expect("admin_telegram_ids_contains_920567169", 920567169 in cfg.admin_telegram_ids)
+
+    # Mutating env after import does not change behavior (no reload).
+    expect("admin_set_loaded", 920567169 in cfg.admin_telegram_ids)
+    env_backup = os.environ.copy()
+    try:
+        os.environ["ADMIN_TELEGRAM_IDS"] = "999,888,777"
+        # No reload — admin_telegram_ids should stay the same.
+        expect("admin_set_immutable_to_env_mutation", 920567169 in cfg.admin_telegram_ids)
+        expect("admin_set_unchanged_after_mutation", 999 not in cfg.admin_telegram_ids)
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+    # Re-export at the package level. The package imports the
+    # value at import time, so verify the live values match.
+    import rag_qdrant as pkg
+    expect("rag_package_exports_is_admin", pkg.is_admin(920567169) is True)
+    expect("rag_package_exports_is_admin_false", pkg.is_admin(999) is False)
+    expect("rag_package_exports_admin_telegram_ids", 920567169 in pkg.admin_telegram_ids)
+
+    # Admin override on ask → no filter. We need valid inference
+    # settings to call answer_question. Patch via _force_settings.
+    from rag_qdrant import inference as inf
+
+    s_valid = Settings(
+        qdrant_collection="acl_test_rag",
+        inference_base_url="https://example.com/v1",
+        inference_api_key="k",
+        inference_model="m",
+    )
+    _force_settings(s_valid)
+    cache_module._semantic = None
+    cache_module._search = None
+
+    ctx = [{"score": 0.9, "id": "1", "text": "t", "source": "s", "chunk_index": 0, "payload": {}}]
+    with patch.object(inf, "search") as m_search, \
+         patch.object(inf, "_answer", return_value="OK"):
+        m_search.return_value = list(ctx)
+        # Admin via override
+        inf.answer_question("q", is_admin_override=True, allowed_telegram_id=None)
+    expect("inf_admin_override_passes_is_admin_true", m_search.call_args[1].get("is_admin") is True)
+    expect("inf_admin_override_no_user_id", m_search.call_args[1].get("allowed_telegram_id") is None)
+
+    # Non-admin via current_telegram_id
+    with patch.object(inf, "search") as m_search:
+        m_search.return_value = []
+        inf.answer_question("q", current_telegram_id=999)
+    expect("inf_nonadmin_passes_user_id", m_search.call_args[1].get("allowed_telegram_id") == 999)
+    expect("inf_nonadmin_passes_is_admin_false", m_search.call_args[1].get("is_admin") is False)
+
+    # Admin via current_telegram_id
+    with patch.object(inf, "search") as m_search:
+        m_search.return_value = []
+        inf.answer_question("q", current_telegram_id=920567169)
+    expect("inf_admin_via_user_passes_is_admin_true", m_search.call_args[1].get("is_admin") is True)
+    expect("inf_admin_via_user_no_user_id", m_search.call_args[1].get("allowed_telegram_id") is None)
+
+    # Cache bypass for non-admin user-specific calls
+    s_cache = Settings(
+        qdrant_collection="acl_test_rag",
+        inference_base_url="https://example.com/v1",
+        inference_api_key="k",
+        inference_model="m",
+        semantic_cache_enabled=True,
+        semantic_cache_path=Path(tempfile.gettempdir()) / "acl_bypass_test.sqlite",
+        semantic_cache_ttl_seconds=86400,
+        semantic_cache_miss_ttl_seconds=3600,
+        semantic_cache_max_entries=100,
+        semantic_cache_similarity_threshold=0.5,
+        semantic_cache_cache_misses=True,
+    )
+    _force_settings(s_cache)
+    cache_module._semantic = None
+    from rag_qdrant.cache import _get_semantic
+    sc = _get_semantic()
+    # Use a real unit vector — cosine with [0.0]*384 is undefined.
+    q_emb = _unit_vector_2d(0.0)
+    sc.store("bypass-q", q_emb, {"answer": "STALE", "contexts": []}, is_miss=False)
+
+    with patch.object(inf, "search", return_value=[{"score": 0.9, "text": "fresh", "source": "s", "chunk_index": 0, "payload": {}}]), \
+         patch.object(inf, "_answer", return_value="FRESH"), \
+         patch.object(inf, "embed_texts", return_value=[q_emb]):
+        result = inf.answer_question("bypass-q", current_telegram_id=999)
+    expect("inf_nonadmin_bypasses_cache", result["answer"] == "FRESH")
+
+    with patch.object(inf, "search", return_value=[{"score": 0.9, "text": "fresh", "source": "s", "chunk_index": 0, "payload": {}}]), \
+         patch.object(inf, "_answer", return_value="FRESH2"), \
+         patch.object(inf, "embed_texts", return_value=[q_emb]):
+        result = inf.answer_question("bypass-q", current_telegram_id=920567169)
+    expect("inf_admin_uses_cache", result["answer"] == "STALE")
+
+    try:
+        os.remove(s_cache.semantic_cache_path)
+    except OSError:
+        pass
+    _force_settings(Settings(
+        qdrant_collection="system_rag",
+        inference_base_url="",
+        inference_api_key="",
+        inference_model="",
+    ))
+
+    # Fail-closed on missing / empty / malformed env. These reload
+    # the config module from scratch and verify the loader raises.
+    # Run these LAST so they don't disturb the rest of the suite.
+    _run_admin_fail_closed_tests(cfg)
+
+
+def _run_admin_fail_closed_tests(cfg) -> None:
+    """Exercise the fail-closed config loader with bad env values."""
+    env_backup = os.environ.copy()
+    try:
+        # 1. Missing env
+        os.environ.pop("ADMIN_TELEGRAM_IDS", None)
+        try:
+            importlib.reload(cfg)
+            expect("admin_fail_closed_raises", False, "expected RuntimeError on import")
+        except RuntimeError as exc:
+            expect("admin_fail_closed_raises", "ADMIN_TELEGRAM_IDS" in str(exc))
+
+        # 2. Empty env
+        os.environ["ADMIN_TELEGRAM_IDS"] = ""
+        try:
+            importlib.reload(cfg)
+            expect("admin_fail_closed_on_empty_raises", False, "expected RuntimeError on import")
+        except RuntimeError:
+            expect("admin_fail_closed_on_empty_raises", True)
+
+        # 3. Non-integer entry
+        os.environ["ADMIN_TELEGRAM_IDS"] = "abc,123"
+        try:
+            importlib.reload(cfg)
+            expect("admin_fail_closed_on_non_int_raises", False, "expected RuntimeError on import")
+        except RuntimeError as exc:
+            expect("admin_fail_closed_on_non_int_raises", "not a valid integer" in str(exc) or "abc" in str(exc))
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+        importlib.reload(cfg)
 
 
 if __name__ == "__main__":
