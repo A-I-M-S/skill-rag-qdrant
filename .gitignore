@@ -10,3 +10,5 @@ __pycache__/
 logs/
 storage/models/
 .opencode/
+.venv-smoke/
+smoke_acl.py

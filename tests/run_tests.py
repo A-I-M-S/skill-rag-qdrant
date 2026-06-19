@@ -71,9 +71,10 @@ sys.modules["qdrant_client.http.models"].PointStruct = lambda **kw: ("PointStruc
 
 
 class _StubFieldCondition:
-    def __init__(self, key: str, match: object) -> None:
+    def __init__(self, key: str | None = None, match: object | None = None, is_empty: bool | None = None) -> None:
         self.key = key
         self.match = match
+        self.is_empty = is_empty
 
 
 class _StubMatchValue:
@@ -731,9 +732,14 @@ def _find_telegram_stragglers(text: str) -> list[str]:
 
 def run_repo_grep_tests() -> None:
     targets = []
+    skip_dirs = {".venv", ".venv-smoke", "venv", "node_modules", ".git", "__pycache__", "dist", "build", ".pytest_cache"}
     for sub in (ROOT,):
         for ext in ("*.py", "*.md", "*.txt", "*.example"):
-            targets.extend(sub.rglob(ext))
+            for p in sub.rglob(ext):
+                # Skip files under known dependency / build / venv directories
+                if any(part in skip_dirs for part in p.parts):
+                    continue
+                targets.append(p)
 
     for path in targets:
         # Skip our own test file (the test framework itself mentions these names
@@ -1156,7 +1162,7 @@ def run_acl_tests() -> None:
 
     # --- List normalization (None → None, [] → [], dedup, normalize) ---
     expect("acl_normalize_list_none", _normalize_allowed_telegram_ids(None) is None)
-    expect("acl_normalize_list_empty", _normalize_allowed_telegram_ids([]) == [])
+    expect("acl_normalize_list_empty", _normalize_allowed_telegram_ids([]) is None)
     expect("acl_normalize_list_mixed", _normalize_allowed_telegram_ids([123, "456", 123]) == ["123", "456"])
     expect("acl_normalize_list_wildcard_solo", _normalize_allowed_telegram_ids(["*", 123]) == ["*"])
     expect("acl_normalize_list_wildcard_only", _normalize_allowed_telegram_ids(["*"]) == ["*"])
@@ -1168,29 +1174,32 @@ def run_acl_tests() -> None:
 
     flt_no_id = _build_acl_filter(None, is_admin=False)
     expect("acl_filter_no_id_returns_filter", flt_no_id is not None)
-    # The no-id filter should be a Filter with one must clause
-    expect("acl_filter_no_id_has_must_clause", len(flt_no_id.must) == 1)
-    # that one must clause references the wildcard
-    expect(
-        "acl_filter_no_id_clause_is_wildcard_match",
-        flt_no_id.must[0].key == ALLOWED_TELEGRAM_IDS_FIELD
-        and flt_no_id.must[0].match.value == WILDCARD_TELEGRAM_ID,
-    )
+    # The no-id filter is a Filter(should=[wildcard, is_empty])
+    expect("acl_filter_no_id_has_should_clause", len(flt_no_id.should) == 2)
+    # one should clause references the wildcard
+    wildcard_cond = next((c for c in flt_no_id.should if c.match is not None and getattr(c.match, "value", None) == WILDCARD_TELEGRAM_ID), None)
+    expect("acl_filter_no_id_has_wildcard_match", wildcard_cond is not None)
+    expect("acl_filter_no_id_wildcard_key_correct", wildcard_cond.key == ALLOWED_TELEGRAM_IDS_FIELD)
+    # the other should clause is the is_empty predicate
+    empty_cond = next((c for c in flt_no_id.should if c.is_empty is True), None)
+    expect("acl_filter_no_id_has_is_empty", empty_cond is not None)
+    expect("acl_filter_no_id_is_empty_key_correct", empty_cond.key == ALLOWED_TELEGRAM_IDS_FIELD)
 
     flt_id = _build_acl_filter(123, is_admin=False)
     expect("acl_filter_with_id_returns_filter", flt_id is not None)
-    # Should be a Filter(must=[Filter(should=[user_match, wildcard])])
-    expect("acl_filter_with_id_has_outer_must", len(flt_id.must) == 1)
-    inner = flt_id.must[0]
-    expect("acl_filter_with_id_inner_is_should", hasattr(inner, "should") and len(inner.should) == 2)
-    keys = sorted([c.key for c in inner.should])
-    expect("acl_filter_with_id_inner_keys_both_acl", keys == [ALLOWED_TELEGRAM_IDS_FIELD, ALLOWED_TELEGRAM_IDS_FIELD])
-    values = sorted([c.match.value for c in inner.should])
-    expect("acl_filter_with_id_values_user_and_wildcard", values == [WILDCARD_TELEGRAM_ID, "123"])
+    # Should be a Filter(should=[user_match, wildcard, is_empty])
+    expect("acl_filter_with_id_has_three_should_clauses", len(flt_id.should) == 3)
+    keys = sorted([c.key for c in flt_id.should if c.match is not None])
+    expect("acl_filter_with_id_match_keys_both_acl", keys == [ALLOWED_TELEGRAM_IDS_FIELD, ALLOWED_TELEGRAM_IDS_FIELD])
+    values = sorted([c.match.value for c in flt_id.should if c.match is not None])
+    expect("acl_filter_with_id_match_values_user_and_wildcard", values == [WILDCARD_TELEGRAM_ID, "123"])
+    empty_cond_id = next((c for c in flt_id.should if c.is_empty is True), None)
+    expect("acl_filter_with_id_has_is_empty", empty_cond_id is not None)
 
     # String id should normalize to its int form
     flt_str = _build_acl_filter("123", is_admin=False)
-    expect("acl_filter_string_id_normalizes_to_str_int", flt_str.must[0].should[0].match.value == "123")
+    user_match_str = next((c for c in flt_str.should if c.match is not None and c.match.value == "123"), None)
+    expect("acl_filter_string_id_normalizes_to_str_int", user_match_str is not None)
 
     # --- Ingest behavior: payload includes / excludes the field correctly ---
     captured, _capture_upsert = _capture_payload_points()
@@ -1215,14 +1224,14 @@ def run_acl_tests() -> None:
     expect("acl_ingest_int_id_normalized", all(c["payload"].get(ALLOWED_TELEGRAM_IDS_FIELD) == ["123"] for c in captured))
     captured.clear()
 
-    # Case 3: explicit empty list (no-access)
+    # Case 3: explicit empty list (now treated as public — field omitted)
     with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
          patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
          patch.object(qdrant_store_module, "get_qdrant_client") as m_client:
         fake_client = types.SimpleNamespace(upsert=_capture_upsert)
         m_client.return_value = fake_client
         ingest_text("hello", source="acl-z", allowed_telegram_ids=[])
-    expect("acl_ingest_empty_list_is_empty_field", all(c["payload"].get(ALLOWED_TELEGRAM_IDS_FIELD) == [] for c in captured))
+    expect("acl_ingest_empty_list_omits_field", all(ALLOWED_TELEGRAM_IDS_FIELD not in c["payload"] for c in captured))
     captured.clear()
 
     # Case 4: int values are normalized to str
@@ -1255,6 +1264,7 @@ def run_acl_tests() -> None:
         def __init__(self) -> None:
             self.points: dict[str, _FakePoint] = {}
             self.set_payload_calls: list[tuple[list[str], dict[str, Any]]] = []
+            self.delete_payload_calls: list[tuple[list[str], list[str]]] = []
 
         def upsert(self, **_kw: Any) -> None:
             pass
@@ -1271,6 +1281,16 @@ def run_acl_tests() -> None:
                 if pt is not None:
                     for k, v in payload.items():
                         pt.payload[k] = v
+
+        def delete_payload(self, **_kw: Any) -> None:
+            keys = _kw.get("keys", [])
+            points = _kw.get("points", [])
+            self.delete_payload_calls.append((list(keys), list(points)))
+            for pid in points:
+                pt = self.points.get(pid)
+                if pt is not None:
+                    for k in keys:
+                        pt.payload.pop(k, None)
 
     fake = _FakeQdrant()
     fake.points["p1"] = _FakePoint("p1", {"source": "src", "text": "t1"})
@@ -1302,13 +1322,15 @@ def run_acl_tests() -> None:
     expect("acl_revoke_removed_count", result["removed"] == 1)
     expect("acl_revoke_p1_now_456_only", fake3.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD] == ["456"])
 
-    # --- revoke_access leaving empty list ---
+    # --- revoke_access deletes the field when the list becomes empty ---
     fake4 = _FakeQdrant()
     fake4.points["p1"] = _FakePoint("p1", {"source": "src", ALLOWED_TELEGRAM_IDS_FIELD: ["123"]})
     with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
          patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake4):
         revoke_access("src", 123)
-    expect("acl_revoke_empty_list_left_as_empty", fake4.points["p1"].payload[ALLOWED_TELEGRAM_IDS_FIELD] == [])
+    expect("acl_revoke_empty_list_deletes_field",
+           ALLOWED_TELEGRAM_IDS_FIELD not in fake4.points["p1"].payload)
+    expect("acl_revoke_empty_list_called_delete_payload", len(fake4.delete_payload_calls) == 1)
 
     # --- show_access behavior ---
     fake5 = _FakeQdrant()
@@ -1366,14 +1388,13 @@ def run_acl_tests() -> None:
         # Non-admin with id → filter
         search("q", allowed_telegram_id=123, is_admin=False)
     expect("acl_search_nonadmin_with_id_has_filter", fake_client.last_query_filter is not None)
+    # The filter is now Filter(should=[user, wildcard, is_empty])
     expect(
         "acl_search_nonadmin_with_id_filter_uses_user_id",
         any(
             getattr(c, "key", None) == ALLOWED_TELEGRAM_IDS_FIELD
             and getattr(getattr(c, "match", None), "value", None) == "123"
-            for c in (fake_client.last_query_filter.must[0].should
-                      if fake_client.last_query_filter.must[0].should
-                      else [fake_client.last_query_filter.must[0]])
+            for c in fake_client.last_query_filter.should
         ),
     )
 
@@ -1381,7 +1402,7 @@ def run_acl_tests() -> None:
     with patch.object(qdrant_store_module, "ensure_collection", return_value=None), \
          patch.object(qdrant_store_module, "embed_texts", return_value=[[0.0] * 384]), \
          patch.object(qdrant_store_module, "get_qdrant_client", return_value=fake_client):
-        # Non-admin no id → wildcard only
+        # Non-admin no id → wildcard + is_empty
         search("q", allowed_telegram_id=None, is_admin=False)
     expect("acl_search_no_id_has_filter", fake_client.last_query_filter is not None)
     expect(
@@ -1389,8 +1410,12 @@ def run_acl_tests() -> None:
         any(
             getattr(c, "match", None) is not None
             and getattr(c.match, "value", None) == WILDCARD_TELEGRAM_ID
-            for c in fake_client.last_query_filter.must
+            for c in fake_client.last_query_filter.should
         ),
+    )
+    expect(
+        "acl_search_no_id_filter_has_is_empty",
+        any(getattr(c, "is_empty", None) is True for c in fake_client.last_query_filter.should),
     )
 
 
