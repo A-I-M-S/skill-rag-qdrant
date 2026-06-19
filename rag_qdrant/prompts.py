@@ -72,6 +72,30 @@ Be concise. One tool call per turn, or a short chat reply. Never call \
 both tools in the same turn.
 """
 
+SYSTEM_PROMPT_WITH_ADMIN = (
+    SYSTEM_PROMPT
+    + """
+
+You also have access to three access-control tools, because the current
+caller is an admin:
+
+- `grant_access(source, telegram_id)` — let a Telegram user see a
+  specific stored item. The `source` argument is the item's stable
+  identifier; `telegram_id` is the numeric Telegram user id to allow.
+  Use this when an admin says "let @alice see the Q3 note" or
+  "let user 123 read the project plan".
+- `revoke_access(source, telegram_id)` — undo a previous grant.
+  Use this when an admin says "remove @bob from it" or "revoke
+  access for 123 on the project plan".
+- `show_access(source)` — show who currently has access to a stored
+  item. Use this when an admin asks "who can see the Q3 note?" or
+  "what's the ACL on the project plan?".
+
+These three tools are admin-only. Never call them on a non-admin
+caller's behalf.
+"""
+)
+
 TOOLS: list[dict] = [
     {
         "type": "function",
@@ -134,6 +158,92 @@ TOOLS: list[dict] = [
     },
 ]
 
-Action = Literal["store_text", "ask_corpus", "chat"]
 
-__all__ = ["SYSTEM_PROMPT", "TOOLS", "Action"]
+def _admin_tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+ADMIN_TOOLS: list[dict] = [
+    _admin_tool(
+        "grant_access",
+        (
+            "Add a Telegram user id to the access-control list of every chunk "
+            "stored under the given source. Use when an admin says things like "
+            "'let @alice see the Q3 note' or 'allow user 123 to read the "
+            "project plan'."
+        ),
+        properties={
+            "source": {
+                "type": "string",
+                "description": (
+                    "The stable identifier of the stored item to grant "
+                    "access to (the same value that was passed to "
+                    "store_text as the `source` argument, or the "
+                    "auto-generated `auto-xxxxxxxxxxxx` value)."
+                ),
+            },
+            "telegram_id": {
+                "type": "string",
+                "description": (
+                    "The numeric Telegram user id to allow, as a string "
+                    "(e.g. \"123456789\")."
+                ),
+            },
+        },
+        required=["source", "telegram_id"],
+    ),
+    _admin_tool(
+        "revoke_access",
+        (
+            "Remove a Telegram user id from the access-control list of every "
+            "chunk stored under the given source. Use when an admin says "
+            "things like 'remove @bob from it' or 'revoke access for 123 on "
+            "the project plan'."
+        ),
+        properties={
+            "source": {
+                "type": "string",
+                "description": "The stable identifier of the stored item.",
+            },
+            "telegram_id": {
+                "type": "string",
+                "description": "The numeric Telegram user id to remove.",
+            },
+        },
+        required=["source", "telegram_id"],
+    ),
+    _admin_tool(
+        "show_access",
+        (
+            "Show the current access-control list and chunk count for a "
+            "stored item. Use when an admin asks 'who can see the Q3 note?' "
+            "or 'what's the ACL on the project plan?'."
+        ),
+        properties={
+            "source": {
+                "type": "string",
+                "description": "The stable identifier of the stored item.",
+            },
+        },
+        required=["source"],
+    ),
+]
+
+
+TOOLS_WITH_ADMIN: list[dict] = TOOLS + ADMIN_TOOLS
+TOOLS_PUBLIC: list[dict] = [t for t in TOOLS if t["function"]["name"] != "store_text"]
+
+Action = Literal["store_text", "ask_corpus", "grant_access", "revoke_access", "show_access", "chat"]
+
+__all__ = ["ADMIN_TOOLS", "Action", "SYSTEM_PROMPT", "SYSTEM_PROMPT_WITH_ADMIN", "TOOLS", "TOOLS_PUBLIC", "TOOLS_WITH_ADMIN"]

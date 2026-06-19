@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import tempfile
 import types
@@ -77,6 +78,10 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Required by rag_qdrant.config: ADMIN_TELEGRAM_IDS is fail-closed at
+# import time. Set a stable default for the offline test environment.
+os.environ.setdefault("ADMIN_TELEGRAM_IDS", "920567169,111,222")
 
 # ---------------------------------------------------------------------------
 # Stub foreign deps so the package imports offline (same trick as run_tests.py)
@@ -112,6 +117,28 @@ sys.modules['qdrant_client.http.models'].PayloadSchemaType = types.SimpleNamespa
 sys.modules['qdrant_client.http.models'].VectorParams = lambda **kw: ('VectorParams', kw)
 sys.modules['qdrant_client.http.models'].Distance = types.SimpleNamespace(COSINE='Cosine')
 sys.modules['qdrant_client.http.models'].PointStruct = lambda **kw: ('PointStruct', kw)
+
+
+class _StubFieldCondition:
+    def __init__(self, key, match):
+        self.key = key
+        self.match = match
+
+
+class _StubMatchValue:
+    def __init__(self, value):
+        self.value = value
+
+
+class _StubFilter:
+    def __init__(self, must=None, should=None):
+        self.must = list(must or [])
+        self.should = list(should or [])
+
+
+sys.modules['qdrant_client.http.models'].FieldCondition = _StubFieldCondition
+sys.modules['qdrant_client.http.models'].MatchValue = _StubMatchValue
+sys.modules['qdrant_client.http.models'].Filter = _StubFilter
 sys.modules['qdrant_client'].QdrantClient = type('QdrantClient', (), {})
 sys.modules['fastembed'].TextEmbedding = type(
     'TextEmbedding',
@@ -199,7 +226,7 @@ def run_handler_behavioral_tests() -> None:
              patch.object(handler_module, 'ingest_file') as m_file, \
              patch.object(handler_module, 'ingest_photo') as m_photo, \
              patch.object(handler_module, 'ask') as m_ask:
-            reply = handle_message(AgentMessage(text='save this for later'))
+            reply = handle_message(AgentMessage(text='save this for later', current_telegram_id=920567169))
         expect('agent_reply_is_dataclass_store_text', isinstance(reply, AgentReply))
         expect('handler_store_text_calls_classify', m_classify.called)
         expect('handler_store_text_calls_ingest_text', m_text.called)
@@ -217,7 +244,7 @@ def run_handler_behavioral_tests() -> None:
         # 2) LLM routes to store_text with an explicit source → handler uses it
         with _stub_classify(('store_text', json.dumps({'text': 'meeting notes', 'source': 'meeting-2026-06-05'}))) as m_classify, \
              patch.object(handler_module, 'ingest_text', return_value=1) as m_text:
-            reply = handle_message(AgentMessage(text='remember these notes'))
+            reply = handle_message(AgentMessage(text='remember these notes', current_telegram_id=920567169))
         expect('handler_store_text_explicit_source_reply', reply.text == 'Ingested 1 chunks from meeting-2026-06-05')
         expect('handler_store_text_explicit_source_kwarg', m_text.call_args[1].get('source') == 'meeting-2026-06-05')
         expect('handler_store_text_explicit_source_photo_paths_empty', reply.photo_paths == ())
@@ -835,6 +862,171 @@ def run_classify_and_route_tests() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Admin tool tests (issue #2)
+# ---------------------------------------------------------------------------
+
+def run_admin_tool_tests() -> None:
+    """Cover grant/revoke/show_access + admin-only gating of store_text."""
+    from rag_qdrant import agent_handler as handler_module
+    from rag_qdrant.config import Settings, is_admin
+    from rag_qdrant.prompts import ADMIN_TOOLS, TOOLS, TOOLS_WITH_ADMIN
+
+    # 1) Tool schema shape
+    expect('admin_tools_is_list', isinstance(ADMIN_TOOLS, list))
+    expect('admin_tools_three_entries', len(ADMIN_TOOLS) == 3)
+    admin_names = sorted(t['function']['name'] for t in ADMIN_TOOLS)
+    expect('admin_tools_contains_grant_revoke_show',
+           admin_names == ['grant_access', 'revoke_access', 'show_access'])
+
+    # TOOLS_WITH_ADMIN = base TOOLS + ADMIN_TOOLS
+    expect('tools_with_admin_superset', len(TOOLS_WITH_ADMIN) == len(TOOLS) + len(ADMIN_TOOLS))
+    expect('tools_with_admin_contains_ask_corpus',
+           any(t['function']['name'] == 'ask_corpus' for t in TOOLS_WITH_ADMIN))
+    expect('tools_base_does_not_contain_admin',
+           not any(t['function']['name'] == 'grant_access' for t in TOOLS))
+
+    # 2) Non-admin LLM call to store_text → ADMIN_ONLY_MESSAGE
+    with _stub_classify(('store_text', json.dumps({'text': 'a note', 'source': ''}))) as m_classify, \
+         patch.object(handler_module, 'ingest_text') as m_text, \
+         patch.object(handler_module, 'ingest_file') as m_file, \
+         patch.object(handler_module, 'ingest_photo') as m_photo, \
+         patch.object(handler_module, 'ask') as m_ask:
+        reply = handle_message(AgentMessage(text='save this', current_telegram_id=999))
+    expect('nonadmin_store_text_returns_admin_only', 'only available to admins' in reply.text)
+    expect('nonadmin_store_text_does_not_ingest', not m_text.called)
+    expect('nonadmin_store_text_does_not_call_ask', not m_ask.called)
+    expect('nonadmin_store_text_photo_paths_empty', reply.photo_paths == ())
+
+    # 3) Non-admin LLM call to grant_access → ADMIN_ONLY_MESSAGE, no qdrant write
+    with _stub_classify(('grant_access', json.dumps({'source': 'x', 'telegram_id': '123'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_grant_access') as m_grant, \
+         patch.object(handler_module, 'qdrant_revoke_access') as m_revoke, \
+         patch.object(handler_module, 'qdrant_show_access') as m_show, \
+         patch.object(handler_module, 'ingest_text') as m_text:
+        reply = handle_message(AgentMessage(text='let 123 see x', current_telegram_id=999))
+    expect('nonadmin_grant_returns_admin_only', 'only available to admins' in reply.text)
+    expect('nonadmin_grant_does_not_touch_qdrant', not (m_grant.called or m_revoke.called or m_show.called))
+    expect('nonadmin_grant_does_not_ingest', not m_text.called)
+
+    # 4) Admin LLM call to grant_access → reaches the qdrant helper
+    with _stub_classify(('grant_access', json.dumps({'source': 'x', 'telegram_id': '123'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_grant_access', return_value={'source': 'x', 'telegram_id': '123', 'updated': 2}) as m_grant, \
+         patch.object(handler_module, 'ingest_text') as m_text:
+        reply = handle_message(AgentMessage(text='let 123 see x', current_telegram_id=920567169))
+    expect('admin_grant_calls_qdrant', m_grant.called)
+    expect('admin_grant_calls_with_source', m_grant.call_args[0][0] == 'x')
+    expect('admin_grant_calls_with_id', m_grant.call_args[0][1] == '123')
+    expect('admin_grant_reply_mentions_count', '2' in reply.text)
+    expect('admin_grant_does_not_ingest', not m_text.called)
+
+    # 5) Admin LLM call to revoke_access
+    with _stub_classify(('revoke_access', json.dumps({'source': 'y', 'telegram_id': '456'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_revoke_access', return_value={'source': 'y', 'telegram_id': '456', 'updated': 1, 'removed': 1}) as m_revoke:
+        reply = handle_message(AgentMessage(text='remove 456 from y', current_telegram_id=920567169))
+    expect('admin_revoke_calls_qdrant', m_revoke.called)
+    expect('admin_revoke_calls_with_source', m_revoke.call_args[0][0] == 'y')
+    expect('admin_revoke_calls_with_id', m_revoke.call_args[0][1] == '456')
+    expect('admin_revoke_reply_mentions_count', '1' in reply.text)
+
+    # 6) Admin LLM call to show_access with existing chunks
+    with _stub_classify(('show_access', json.dumps({'source': 'q3'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_show_access', return_value={'source': 'q3', 'allowed_telegram_ids': ['123', '456'], 'chunk_count': 3}) as m_show:
+        reply = handle_message(AgentMessage(text='who can see q3?', current_telegram_id=920567169))
+    expect('admin_show_calls_qdrant', m_show.called)
+    expect('admin_show_reply_mentions_chunks', '3' in reply.text)
+    expect('admin_show_reply_lists_ids', '123' in reply.text and '456' in reply.text)
+
+    # 7) Admin LLM call to show_access with no chunks
+    with _stub_classify(('show_access', json.dumps({'source': 'missing'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_show_access', return_value={'source': 'missing', 'allowed_telegram_ids': [], 'chunk_count': 0}):
+        reply = handle_message(AgentMessage(text='who can see missing?', current_telegram_id=920567169))
+    expect('admin_show_no_chunks_message', 'No chunks' in reply.text)
+
+    # 8) Admin LLM call to show_access with empty ACL
+    with _stub_classify(('show_access', json.dumps({'source': 'private'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_show_access', return_value={'source': 'private', 'allowed_telegram_ids': [], 'chunk_count': 5}):
+        reply = handle_message(AgentMessage(text='who can see private?', current_telegram_id=920567169))
+    expect('admin_show_empty_acl_message', 'admin-only' in reply.text or 'no Telegram id' in reply.text)
+
+    # 9) Malformed grant_access payload → error string
+    with _stub_classify(('grant_access', '{not json')) as m_classify, \
+         patch.object(handler_module, 'qdrant_grant_access') as m_grant:
+        reply = handle_message(AgentMessage(text='let 123 see x', current_telegram_id=920567169))
+    expect('admin_grant_malformed_payload_error', 'malformed' in reply.text.lower())
+    expect('admin_grant_malformed_no_qdrant', not m_grant.called)
+
+    # 10) Grant_access missing required args
+    with _stub_classify(('grant_access', json.dumps({'source': '', 'telegram_id': '123'}))) as m_classify, \
+         patch.object(handler_module, 'qdrant_grant_access') as m_grant:
+        reply = handle_message(AgentMessage(text='grant empty', current_telegram_id=920567169))
+    expect('admin_grant_missing_source_error', 'requires' in reply.text.lower())
+    expect('admin_grant_missing_source_no_qdrant', not m_grant.called)
+
+    # 11) Non-admin with store_text using a string id (not int) → still gated
+    with _stub_classify(('store_text', json.dumps({'text': 'note', 'source': ''}))) as m_classify, \
+         patch.object(handler_module, 'ingest_text') as m_text:
+        reply = handle_message(AgentMessage(text='save', current_telegram_id='not-admin'))
+    expect('nonadmin_string_id_store_text_gated', 'only available to admins' in reply.text)
+    expect('nonadmin_string_id_store_text_no_ingest', not m_text.called)
+
+    # 12) is_admin semantics: the public tool schema is TOOLS without
+    # store_text (already in handler code), but the admin one is
+    # TOOLS_WITH_ADMIN. Verify the handler picks the right one.
+    captured_schema: dict[str, object] = {}
+
+    def _capture_classify(message_text, **kwargs):
+        captured_schema['tools'] = kwargs.get('tools')
+        return ('chat', 'ok')
+
+    with patch.object(handler_module, 'classify_and_route', side_effect=_capture_classify):
+        handle_message(AgentMessage(text='hi', current_telegram_id=920567169))
+    expect('admin_receives_tools_with_admin', captured_schema.get('tools') is TOOLS_WITH_ADMIN)
+
+    with patch.object(handler_module, 'classify_and_route', side_effect=_capture_classify):
+        handle_message(AgentMessage(text='hi', current_telegram_id=999))
+    expect('nonadmin_receives_base_tools', captured_schema.get('tools') is TOOLS)
+
+    # 13) Admin on ask_corpus → passes admin=True to ask (no ACL filter)
+    captured_ask: dict[str, object] = {}
+
+    def _capture_ask(question, **kwargs):
+        captured_ask['kwargs'] = kwargs
+        return {'answer': 'a', 'contexts': [], 'photos': []}
+
+    with _stub_classify(('ask_corpus', 'q')) as m_classify, \
+         patch.object(handler_module, 'ask', side_effect=_capture_ask):
+        reply = handle_message(AgentMessage(text='q', current_telegram_id=920567169))
+    expect('admin_ask_passes_current_telegram_id',
+           captured_ask.get('kwargs', {}).get('current_telegram_id') == 920567169)
+    expect('admin_ask_reply_is_answer', reply.text == 'a')
+
+    # 14) Non-admin on ask_corpus → passes user id (filter applied in ask)
+    captured_ask.clear()
+    with _stub_classify(('ask_corpus', 'q')) as m_classify, \
+         patch.object(handler_module, 'ask', side_effect=_capture_ask):
+        reply = handle_message(AgentMessage(text='q', current_telegram_id=999))
+    expect('nonadmin_ask_passes_user_id',
+           captured_ask.get('kwargs', {}).get('current_telegram_id') == 999)
+
+    # 15) current_telegram_id default (None) is treated as non-admin
+    with _stub_classify(('store_text', json.dumps({'text': 'a', 'source': ''}))) as m_classify, \
+         patch.object(handler_module, 'ingest_text') as m_text:
+        reply = handle_message(AgentMessage(text='save'))
+    expect('no_caller_id_store_text_gated', 'only available to admins' in reply.text)
+    expect('no_caller_id_no_ingest', not m_text.called)
+
+    # 16) ADMIN_ONLY_MESSAGE export
+    from rag_qdrant.agent_handler import ADMIN_ONLY_MESSAGE as _msg
+    expect('admin_only_message_is_string', isinstance(_msg, str))
+    expect('admin_only_message_mentions_admin', 'admin' in _msg.lower())
+
+    # 17) The handler's admin gating is exposed via __all__
+    from rag_qdrant import agent_handler
+    expect('admin_only_message_in_dunder_all', 'ADMIN_ONLY_MESSAGE' in agent_handler.__all__)
+    expect('is_admin_re_exported_in_dunder_all', 'is_admin' in agent_handler.__all__)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -845,6 +1037,8 @@ def main() -> int:
     run_default_source_tests()
     print('\n== classify_and_route unit tests ==')
     run_classify_and_route_tests()
+    print('\n== admin tool tests ==')
+    run_admin_tool_tests()
     print(f'\n{len(passed)} passed, {len(failed)} failed')
     if failed:
         for label, detail in failed:

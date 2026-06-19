@@ -45,6 +45,56 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
+# ---------------------------------------------------------------------------
+# Admin role gate (issue #3)
+# ---------------------------------------------------------------------------
+
+def _load_admin_telegram_ids() -> tuple[int, ...]:
+    """Load admin telegram ids from ``ADMIN_TELEGRAM_IDS`` at import time.
+
+    Fail-closed: empty / unset / whitespace-only values raise
+    :class:`RuntimeError` so a missing or misconfigured environment
+    surfaces immediately, not silently. The returned tuple is frozen
+    and subsequent ``os.environ`` mutations have no effect.
+    """
+    raw = os.getenv("ADMIN_TELEGRAM_IDS", "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise RuntimeError(
+            "ADMIN_TELEGRAM_IDS is required and must contain at least one "
+            "comma-separated Telegram user id. Set it in .env."
+        )
+    ids: list[int] = []
+    for part in parts:
+        try:
+            ids.append(int(part))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"ADMIN_TELEGRAM_IDS entry {part!r} is not a valid integer: {exc}"
+            ) from exc
+    return tuple(ids)
+
+
+admin_telegram_ids: tuple[int, ...] = _load_admin_telegram_ids()
+ADMIN_TELEGRAM_IDS: tuple[int, ...] = admin_telegram_ids
+
+
+def is_admin(telegram_id: int | str | None) -> bool:
+    """Server-side check: is ``telegram_id`` in the admin set?
+
+    Accepts ``int`` or stringified int. ``None`` is always non-admin.
+    String ids are normalized to ``int`` to match the format stored
+    in the admin set, so callers can pass either shape.
+    """
+    if telegram_id is None:
+        return False
+    try:
+        normalized = int(telegram_id)
+    except (TypeError, ValueError):
+        return False
+    return normalized in admin_telegram_ids
+
+
 @dataclass(frozen=True)
 class Settings:
     skill_root: Path = SKILL_ROOT
