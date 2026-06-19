@@ -76,7 +76,7 @@ from pathlib import Path
 from .config import is_admin
 from .inference import ask, classify_and_route
 from .photo_store import Photo, save_photo
-from .prompts import SYSTEM_PROMPT, TOOLS, TOOLS_WITH_ADMIN
+from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_WITH_ADMIN, TOOLS, TOOLS_WITH_ADMIN
 from .qdrant_store import (
     grant_access as qdrant_grant_access,
     ingest_file,
@@ -85,6 +85,8 @@ from .qdrant_store import (
     revoke_access as qdrant_revoke_access,
     show_access as qdrant_show_access,
 )
+from .user_cache import record_seen, resolve_id as user_cache_resolve_id
+from .user_cache import resolve_username as user_cache_resolve_username
 
 SUPPORTED_ATTACHMENT_SUFFIXES = frozenset({'.pdf', '.txt', '.md', '.text'})
 
@@ -97,7 +99,12 @@ ADMIN_ONLY_MESSAGE = (
     "or perform the action for you."
 )
 
-TOOL_NAMES_REQUIRING_ADMIN = frozenset({"store_text", "grant_access", "revoke_access", "show_access"})
+TOOL_NAMES_REQUIRING_ADMIN = frozenset({"store_text", "grant_access", "revoke_access", "resolve_username", "show_access"})
+
+USERNAME_NOT_SEEN_MESSAGE = (
+    "That user hasn't messaged this bot yet. Ask them to send any message to "
+    "the bot first, then try again."
+)
 
 
 @dataclass(frozen=True)
@@ -134,12 +141,24 @@ class AgentMessage:
             :func:`rag_qdrant.config.is_admin`) and to apply the
             access-control filter to ``ask_corpus`` lookups. ``None``
             is treated as a non-admin public caller.
+        current_username: Optional Telegram ``@username`` of the
+            sender, with or without a leading ``@``. Recorded in the
+            local user cache on every inbound message so admins can
+            later reference this user by ``@username`` in chat (e.g.
+            "let @alice see the Q3 note"). ``None`` when the user
+            has no public Telegram username.
+        current_first_name: Optional Telegram display name of the
+            sender. Recorded in the user cache for richer replies
+            (``resolve_username`` returns it). ``None`` when
+            unavailable.
     """
 
     text: str
     attachments: tuple[Attachment, ...] = ()
     photos: tuple[Photo, ...] = ()
     current_telegram_id: int | str | None = None
+    current_username: str | None = None
+    current_first_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +270,53 @@ def _combine_notice(attachment_lines: list[str], photo_lines: list[str]) -> str:
     return "\n".join(attachment_lines + photo_lines)
 
 
+def _resolve_admin_telegram_id(value: int | str | None) -> int | str | None:
+    """Resolve a tool-call ``telegram_id`` argument.
+
+    Numeric / numeric-string values pass through unchanged (Qdrant
+    normalizes them). String values that begin with ``@`` (or look
+    like a username, i.e. non-numeric) are resolved through the
+    local user cache. ``None`` and empty strings return ``None``.
+
+    Returns the numeric id (``int``) on a successful username
+    lookup, the original value when no resolution is needed, or
+    ``None`` when the username is unknown (the caller turns that
+    into a clear error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text == "*":
+        return text
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+    tid = user_cache_resolve_username(text)
+    return tid
+
+
+def _record_inbound_user(message: AgentMessage) -> None:
+    """Cache the sender's id / username / first_name from an inbound message.
+
+    Best-effort: any error (e.g. read-only filesystem) is logged at
+    WARNING and swallowed. We only call :func:`record_seen` when
+    ``current_telegram_id`` is set; usernames without a numeric id
+    cannot be reliably resolved later.
+    """
+    if message.current_telegram_id is None:
+        return
+    record_seen(
+        message.current_telegram_id,
+        username=message.current_username,
+        first_name=message.current_first_name,
+    )
+
+
 def handle_message(message: AgentMessage) -> AgentReply:
     """Dispatch one :class:`AgentMessage` via the LLM-routed agent flow.
 
@@ -274,7 +340,14 @@ def handle_message(message: AgentMessage) -> AgentReply:
     The ``ask_corpus`` branch forwards the caller's
     ``current_telegram_id`` into the search filter so non-admins see
     only the chunks their ACL allows. Admins see every chunk.
+
+    On every inbound message, the handler caches the sender's
+    Telegram id / username / first_name in the local user cache
+    (``logs/user_cache.json``) so admins can later reference the
+    user by ``@username`` in chat. The LLM-facing ``resolve_username``
+    tool exposes the same lookup back to admins.
     """
+    _record_inbound_user(message)
     attachment_notice_lines: list[str] = _ingest_attachments(message.attachments)
     photo_notice_lines, saved_photo_paths = _ingest_photos(message.photos)
     ingest_notice = _combine_notice(attachment_notice_lines, photo_notice_lines)
@@ -286,7 +359,7 @@ def handle_message(message: AgentMessage) -> AgentReply:
     llm_user_text = f"{ingest_notice}\n\n{body}" if ingest_notice else body
     caller_is_admin = is_admin(message.current_telegram_id)
     tool_schema = TOOLS_WITH_ADMIN if caller_is_admin else TOOLS
-    system_prompt = SYSTEM_PROMPT
+    system_prompt = SYSTEM_PROMPT_WITH_ADMIN if caller_is_admin else SYSTEM_PROMPT
 
     action, payload = classify_and_route(
         llm_user_text,
@@ -339,7 +412,10 @@ def handle_message(message: AgentMessage) -> AgentReply:
                 text='Error: grant_access requires non-empty source and telegram_id.',
                 photo_paths=(),
             )
-        result = qdrant_grant_access(source, tid)
+        resolved = _resolve_admin_telegram_id(tid)
+        if resolved is None:
+            return AgentReply(text=USERNAME_NOT_SEEN_MESSAGE, photo_paths=())
+        result = qdrant_grant_access(source, resolved)
         return AgentReply(
             text=f'Granted access to {result["telegram_id"]} for source {result["source"]} '
                  f'({result["updated"]} chunk(s) updated).',
@@ -361,10 +437,44 @@ def handle_message(message: AgentMessage) -> AgentReply:
                 text='Error: revoke_access requires non-empty source and telegram_id.',
                 photo_paths=(),
             )
-        result = qdrant_revoke_access(source, tid)
+        resolved = _resolve_admin_telegram_id(tid)
+        if resolved is None:
+            return AgentReply(text=USERNAME_NOT_SEEN_MESSAGE, photo_paths=())
+        result = qdrant_revoke_access(source, resolved)
         return AgentReply(
             text=f'Revoked access for {result["telegram_id"]} from source {result["source"]} '
                  f'({result["removed"]} chunk(s) updated).',
+            photo_paths=(),
+        )
+
+    if action == 'resolve_username':
+        try:
+            parsed = json.loads(payload)
+            username = (parsed.get('username') or '').strip()
+        except (TypeError, ValueError):
+            return AgentReply(
+                text='Error: malformed resolve_username payload from the routing LLM.',
+                photo_paths=(),
+            )
+        if not username:
+            return AgentReply(
+                text='Error: resolve_username requires a non-empty username.',
+                photo_paths=(),
+            )
+        tid = user_cache_resolve_username(username)
+        if tid is None:
+            return AgentReply(text=USERNAME_NOT_SEEN_MESSAGE, photo_paths=())
+        meta = user_cache_resolve_id(tid) or {}
+        first = (meta.get('first_name') or '').strip()
+        if first:
+            return AgentReply(
+                text=f'@{meta.get("username") or username.lstrip("@")} '
+                     f'(Telegram id {tid}, "{first}").',
+                photo_paths=(),
+            )
+        return AgentReply(
+            text=f'@{meta.get("username") or username.lstrip("@")} '
+                 f'(Telegram id {tid}).',
             photo_paths=(),
         )
 
@@ -410,10 +520,15 @@ def handle_message(message: AgentMessage) -> AgentReply:
             )
         result = ask(question, current_telegram_id=message.current_telegram_id)
         matched = [p.get('path') for p in result.get('photos', []) if p.get('path')]
-        return AgentReply(
-            text=result['answer'],
-            photo_paths=tuple(matched),
-        )
+        answer = result.get('answer') or ''
+        # Override the LLM-facing "No relevant information found" with the
+        # grumpy voice: never explain the filter, never leak that a
+        # restricted chunk exists — both ACL-filtered and genuinely absent
+        # surface as the same curt line.
+        from .inference import NO_RELEVANT_ANSWER
+        if answer.strip() == NO_RELEVANT_ANSWER:
+            return AgentReply(text='Nothing on that.', photo_paths=())
+        return AgentReply(text=answer, photo_paths=tuple(matched))
 
     return AgentReply(text=payload or '', photo_paths=())
 
@@ -425,6 +540,7 @@ __all__ = [
     'Attachment',
     'Photo',
     'SUPPORTED_ATTACHMENT_SUFFIXES',
+    'USERNAME_NOT_SEEN_MESSAGE',
     'handle_message',
     'is_admin',
 ]

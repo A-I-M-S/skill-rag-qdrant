@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import re
 import sys
@@ -153,6 +154,7 @@ import rag_qdrant.inference as inference_module  # noqa: E402
 import rag_qdrant.qdrant_store as qdrant_store_module  # noqa: E402
 import rag_qdrant.text_processing as text_processing_module  # noqa: E402
 import rag_qdrant.__main__ as cli_module  # noqa: E402
+import rag_qdrant.user_cache as user_cache_module  # noqa: E402
 
 passed: list[str] = []
 failed: list[tuple[str, str]] = []
@@ -779,6 +781,372 @@ def run_repo_grep_tests() -> None:
             expect(f"grep_{path.name}_no_telegram_stragglers", True)
 
 
+def run_persona_tests() -> None:
+    """Cover the grumpy-office-worker persona (issue #5)."""
+    from rag_qdrant import agent_handler as _handler
+    from rag_qdrant.prompts import (
+        SYSTEM_PROMPT,
+        SYSTEM_PROMPT_WITH_ADMIN,
+        TOOLS,
+        TOOLS_WITH_ADMIN,
+    )
+    import rag_qdrant.prompts as prompts_module
+    import rag_qdrant.inference as inference_module
+
+    # --- Forbidden phrases / patterns ---
+    # Strip the meta-instruction paragraphs (e.g. "No 'as an AI'. No
+    # 'Great question'.") before checking — those are the persona
+    # telling the model what NOT to say, not what it says. Match any
+    # sequence of `No "phrase".` / `No 'phrase'.` clauses (including
+    # connected `or "..."` lists) and remove them.
+    import re as _re
+    cleaned = _re.sub(r"No [\"'][^\"'\n.]*[\"'](?:\s+or\s+[\"'][^\"'\n.]*[\"'])*\.?", "", SYSTEM_PROMPT)
+    lowered = cleaned.lower()
+    for forbidden in (
+        "as an ai",
+        "i'd be happy to help",
+        "i would be happy to help",
+        "great question",
+        "no worries",
+        "certainly",
+        "of course",
+    ):
+        expect(f"persona_no_{forbidden!r}", forbidden not in lowered)
+    # "Sure," as a sentence opener is forbidden. The bare `Sure,` should
+    # only appear inside negation clauses (which we just stripped).
+    expect("persona_no_sure_opener", not _re.search(r"\bsure,\s", lowered))
+
+    # No exclamation marks anywhere in the system prompts.
+    expect("persona_no_exclamation_marks_in_system_prompt", "!" not in SYSTEM_PROMPT)
+    expect(
+        "persona_no_exclamation_marks_in_system_prompt_with_admin",
+        "!" not in SYSTEM_PROMPT_WITH_ADMIN,
+    )
+
+    # The persona is curt — under 2500 chars for the base prompt
+    # (long enough to convey the role, short enough to be curt).
+    expect("persona_system_prompt_is_concise", len(SYSTEM_PROMPT) < 2500)
+
+    # SYSTEM_PROMPT_WITH_ADMIN = SYSTEM_PROMPT + admin suffix.
+    expect(
+        "persona_admin_prompt_extends_base",
+        SYSTEM_PROMPT_WITH_ADMIN.startswith(SYSTEM_PROMPT),
+    )
+    expect(
+        "persona_admin_prompt_strictly_longer",
+        len(SYSTEM_PROMPT_WITH_ADMIN) > len(SYSTEM_PROMPT),
+    )
+
+    # Admin suffix must mention the four admin tools.
+    for name in ("grant_access", "revoke_access", "show_access", "resolve_username"):
+        expect(f"persona_admin_suffix_mentions_{name}", name in SYSTEM_PROMPT_WITH_ADMIN)
+
+    # Tool schemas unchanged in count / shape (persona is voice only, not tools).
+    expect("persona_tools_count_unchanged", len(TOOLS) == 2)
+    expect("persona_admin_tools_count_unchanged", len(TOOLS_WITH_ADMIN) == len(TOOLS) + 4)
+
+    # ask() inference prompt is NOT the persona prompt (separate concern).
+    expect(
+        "persona_ask_prompt_is_not_system_prompt",
+        inference_module.SYSTEM_PROMPT != SYSTEM_PROMPT,
+    )
+
+    # --- Handler picks the right prompt per caller ---
+    from rag_qdrant import AgentMessage as _AM
+    captured: dict[str, object] = {}
+
+    def _capture_classify(message_text, **kwargs):
+        captured["system_prompt"] = kwargs.get("system_prompt")
+        captured["tools"] = kwargs.get("tools")
+        return ("chat", "Mm.")
+
+    with patch.object(_handler, "classify_and_route", side_effect=_capture_classify):
+        _handler.handle_message(_AM(text="hi", current_telegram_id=920567169))
+    expect(
+        "persona_admin_gets_admin_prompt",
+        captured.get("system_prompt") is SYSTEM_PROMPT_WITH_ADMIN,
+    )
+    expect(
+        "persona_admin_gets_admin_tools",
+        captured.get("tools") is TOOLS_WITH_ADMIN,
+    )
+
+    captured.clear()
+    with patch.object(_handler, "classify_and_route", side_effect=_capture_classify):
+        _handler.handle_message(_AM(text="hi", current_telegram_id=999))
+    expect(
+        "persona_nonadmin_gets_base_prompt",
+        captured.get("system_prompt") is SYSTEM_PROMPT,
+    )
+    expect(
+        "persona_nonadmin_gets_base_tools",
+        captured.get("tools") is TOOLS,
+    )
+
+    # --- ask_corpus returning "No relevant information found" surfaces as
+    # "Nothing on that." (no leak of the filter, no preamble). ---
+    with patch.object(_handler, "classify_and_route", return_value=("ask_corpus", "policy?")), \
+         patch.object(
+             _handler, "ask",
+             return_value={"answer": "No relevant information found", "contexts": [], "photos": []},
+         ):
+        reply = _handler.handle_message(_AM(text="what's the policy?", current_telegram_id=999))
+    expect("persona_nothing_on_that_for_empty", reply.text == "Nothing on that.")
+    expect("persona_nothing_on_that_no_leak", "filter" not in reply.text.lower())
+
+    # And when ask() returns a real answer, the handler passes it through.
+    with patch.object(_handler, "classify_and_route", return_value=("ask_corpus", "policy?")), \
+         patch.object(
+             _handler, "ask",
+             return_value={"answer": "Annual leave is 14 days.", "contexts": [], "photos": []},
+         ):
+        reply = _handler.handle_message(_AM(text="policy?", current_telegram_id=999))
+    expect("persona_real_answer_passes_through", reply.text == "Annual leave is 14 days.")
+
+
+def run_docs_tests() -> None:
+    """Cover issue #6 — .env.example, README, SKILL.md coherence with the code."""
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    # --- .env.example has the two new env vars + the admin comment ---
+    expect("env_example_has_admin_telegram_ids", "ADMIN_TELEGRAM_IDS" in env_example)
+    expect("env_example_has_admin_known_id", "920567169" in env_example)
+    expect(
+        "env_example_has_admin_email_comment",
+        "boonhian@blueacres.sg" in env_example
+        and "boonching@blueacres.sg" in env_example
+        and "aloycwl@gmail.com" in env_example,
+    )
+    expect("env_example_has_rag_user_cache_path", "RAG_USER_CACHE_PATH" in env_example)
+    expect("env_example_user_cache_default", "logs/user_cache.json" in env_example)
+
+    # .env.example keeps the older vars (don't accidentally drop them).
+    for kept in ("QDRANT_URL", "INFERENCE_BASE_URL", "FASTEMBED_MODEL", "RAG_PHOTOS_DIR"):
+        expect(f"env_example_keeps_{kept}", kept in env_example)
+
+    # --- README has the Access control section + Security notes ---
+    expect("readme_has_access_control_section", "## Access control" in readme)
+    expect(
+        "readme_access_control_mentions_three_questions",
+        "restrict" in readme.lower()
+        and "grant" in readme.lower()
+        and "revoke" in readme.lower()
+        and "public" in readme.lower()
+        and "admin" in readme.lower(),
+    )
+    expect("readme_has_security_notes", "## Security notes" in readme or "### Security notes" in readme)
+    expect(
+        "readme_security_notes_mention_admin_frozen",
+        "once at import" in readme.lower() or "frozen" in readme.lower(),
+    )
+    expect("readme_mentions_resolve_username", "resolve_username" in readme)
+    expect(
+        "readme_documents_allowed_telegram_ids_param",
+        "allowed_telegram_ids" in readme and "allowed_telegram_id" in readme,
+    )
+
+    # --- SKILL.md ---
+    expect("skill_md_mentions_admin_telegram_ids", "ADMIN_TELEGRAM_IDS" in skill)
+    expect(
+        "skill_md_documents_new_admin_tools",
+        "grant_access" in skill and "revoke_access" in skill
+        and "show_access" in skill and "resolve_username" in skill,
+    )
+    expect(
+        "skill_md_dedicated_install_note",
+        "dedicated" in skill.lower() and "openclaw" in skill.lower(),
+    )
+    # The persona text is in the system prompt; SKILL should reflect the new voice.
+    expect(
+        "skill_md_persona_is_grumpy",
+        "grumpy" in skill.lower() and "no exclamation" in skill.lower(),
+    )
+
+
+def run_user_cache_tests() -> None:
+    """Cover the local @username <-> telegram_id resolver cache (issue #7)."""
+    import threading as _threading
+    import time as _time
+
+    from rag_qdrant.user_cache import (
+        cache_path as _uc_cache_path,
+        cache_stats as _uc_cache_stats,
+        clear_cache as _uc_clear,
+        record_seen as _uc_record,
+        resolve_id as _uc_resolve_id,
+        resolve_username as _uc_resolve_username,
+    )
+    import rag_qdrant.config as _cfg
+
+    # --- Module shape ---
+    src = inspect.getsource(user_cache_module)
+    expect("user_cache_module_defines_record_seen", "def record_seen(" in src)
+    expect("user_cache_module_defines_resolve_username", "def resolve_username(" in src)
+    expect("user_cache_module_defines_resolve_id", "def resolve_id(" in src)
+    expect("user_cache_module_uses_threading_lock", "threading.Lock" in src)
+    expect("user_cache_module_atomic_write", "os.replace" in src)
+    expect("user_cache_module_chmod_0600", "0o600" in src)
+    expect("user_cache_module_normalizes_username", "lstrip" in src and "lower" in src)
+
+    # --- Per-test path: redirect RAG_USER_CACHE_PATH via env + skill_root ---
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        # Force the module to look at this dir by setting env before any
+        # call to cache_path(). The module reads env on every call.
+        os.environ["RAG_USER_CACHE_PATH"] = str(tmp_path / "user_cache.json")
+
+        # Fresh start
+        try:
+            (tmp_path / "user_cache.json").unlink()
+        except OSError:
+            pass
+        path = _uc_cache_path()
+        expect("user_cache_path_under_tmp", path == tmp_path / "user_cache.json")
+
+        # First record_seen creates the file
+        _uc_record(428765901, username="alice", first_name="Alice")
+        expect("user_cache_file_created", path.exists())
+
+        # Stats reflect 1 user
+        stats = _uc_cache_stats()
+        expect("user_cache_stats_by_id_one", stats["by_id"] == 1)
+        expect("user_cache_stats_by_username_one", stats["by_username"] == 1)
+
+        # Resolve by lowercase, mixed case, with and without leading @
+        expect("user_cache_resolve_alice", _uc_resolve_username("alice") == 428765901)
+        expect("user_cache_resolve_Alice_caps", _uc_resolve_username("Alice") == 428765901)
+        expect("user_cache_resolve_at_Alice", _uc_resolve_username("@Alice") == 428765901)
+        expect("user_cache_resolve_at_alice", _uc_resolve_username("@alice") == 428765901)
+        expect("user_cache_resolve_with_whitespace", _uc_resolve_username("  @alice  ") == 428765901)
+
+        # Resolve by id (returns the metadata record)
+        rec = _uc_resolve_id(428765901)
+        expect("user_cache_resolve_id_returns_record", isinstance(rec, dict))
+        expect("user_cache_resolve_id_username", rec and rec.get("username") == "alice")
+        expect("user_cache_resolve_id_first_name", rec and rec.get("first_name") == "Alice")
+        expect("user_cache_resolve_id_has_last_seen", bool(rec and rec.get("last_seen")))
+
+        # Second DM updates last_seen but keeps mapping stable
+        first_seen = rec["last_seen"]
+        _time.sleep(1.05)
+        _uc_record(428765901, username="alice", first_name="Alice")
+        rec2 = _uc_resolve_id(428765901)
+        expect("user_cache_resolve_id_stable_mapping", _uc_resolve_username("alice") == 428765901)
+        expect("user_cache_last_seen_updated", rec2["last_seen"] != first_seen)
+
+        # Miss returns None
+        expect("user_cache_resolve_ghost_none", _uc_resolve_username("ghost") is None)
+        expect("user_cache_resolve_id_missing_none", _uc_resolve_id(999999) is None)
+
+        # Username change: alice -> alicia; old "alice" must be dropped
+        _uc_record(428765901, username="alicia", first_name="Alicia")
+        expect("user_cache_username_changed_resolve_new", _uc_resolve_username("alicia") == 428765901)
+        expect("user_cache_username_changed_stale_dropped", _uc_resolve_username("alice") is None)
+        rec3 = _uc_resolve_id(428765901)
+        expect("user_cache_username_changed_meta", rec3 and rec3.get("username") == "alicia")
+
+        # File mode is 0o600
+        st = path.stat()
+        expect("user_cache_file_mode_0600", oct(st.st_mode & 0o777) == "0o600")
+
+        # Multiple users, dedup on by_username
+        _uc_record(920000001, username="bob")
+        _uc_record(920000002, username="Bob")  # same username, different case -> same key
+        stats2 = _uc_cache_stats()
+        expect("user_cache_two_by_id", stats2["by_id"] == 3)
+        expect("user_cache_dedup_username_case_insensitive", stats2["by_username"] == 2)
+
+        # Atomic write on crash: simulate a crash mid-write by writing a
+        # partial temp file in the directory. The next record_seen must
+        # leave the prior good copy intact (atomic rename only) and
+        # write a new temp file with a unique name (so an orphan never
+        # gets overwritten / clobbered by the next call).
+        partial = tmp_path / ".user_cache.partial.tmp"
+        partial.write_text("{this is not valid json")
+        try:
+            _uc_record(428765901, username="alicia")
+        except OSError as exc:
+            expect("user_cache_atomic_write_after_crash_succeeds", False, str(exc))
+        else:
+            expect("user_cache_atomic_write_after_crash_succeeds", True)
+        # The good file is still valid JSON.
+        try:
+            data = json.loads(path.read_text())
+            expect("user_cache_atomic_write_corrupt_temp_ignored", isinstance(data, dict))
+            # The next write produces a new unique temp name and renames it.
+            expect("user_cache_atomic_write_orphan_intact",
+                   partial.exists() and "{this is not valid json" in partial.read_text())
+        except (OSError, ValueError) as exc:
+            expect("user_cache_atomic_write_corrupt_temp_ignored", False, str(exc))
+
+        # Concurrent writes (10 threads, 100 records each) — final count
+        # matches, no file corruption.
+        try:
+            (tmp_path / "user_cache.json").unlink()
+        except OSError:
+            pass
+        errors: list[BaseException] = []
+
+        def _worker(start: int) -> None:
+            try:
+                for i in range(100):
+                    _uc_record(10_000_000 + start * 100 + i, username=f"u{start}_{i}")
+            except BaseException as exc:  # pragma: no cover - threading harness
+                errors.append(exc)
+
+        threads = [_threading.Thread(target=_worker, args=(t,)) for t in range(10)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        expect("user_cache_concurrent_no_errors", not errors, str(errors[:1]))
+        stats3 = _uc_cache_stats()
+        expect("user_cache_concurrent_count", stats3["by_id"] == 10 * 100)
+        expect("user_cache_concurrent_username_count", stats3["by_username"] == 10 * 100)
+
+        # clear_cache
+        removed = _uc_clear()
+        expect("user_cache_clear_returns_count", removed == 10 * 100)
+        expect("user_cache_clear_removes_file", not path.exists())
+        expect("user_cache_resolve_after_clear_none", _uc_resolve_username("u0_0") is None)
+
+        # Empty / None username handling
+        _uc_record(555, username=None, first_name="NoName")
+        rec_none = _uc_resolve_id(555)
+        expect("user_cache_record_no_username_meta", rec_none and rec_none.get("username") is None)
+        expect("user_cache_resolve_empty_returns_none", _uc_resolve_username("") is None)
+        expect("user_cache_resolve_at_only_returns_none", _uc_resolve_username("@") is None)
+
+        # Integer telegram_id is accepted (stringified internally)
+        _uc_record(777, username="carol")
+        expect("user_cache_resolve_int_id", _uc_resolve_username("carol") == 777)
+
+    # --- RAG_USER_CACHE_PATH honored (relative path under skill_root) ---
+    rel = "logs/_uc_relative.json"
+    try:
+        os.environ["RAG_USER_CACHE_PATH"] = rel
+        _uc_clear()
+        _uc_record(123456, username="rel_user")
+        expected = _cfg.settings.skill_root / rel
+        expect("user_cache_relative_path_under_skill_root", expected.exists())
+        expect("user_cache_resolve_rel_user", _uc_resolve_username("rel_user") == 123456)
+    finally:
+        os.environ.pop("RAG_USER_CACHE_PATH", None)
+        # Clean up
+        try:
+            (_cfg.settings.skill_root / rel).unlink()
+        except OSError:
+            pass
+
+    # --- Public re-exports ---
+    import rag_qdrant as _pkg
+    expect("package_exports_record_seen", hasattr(_pkg, "record_seen"))
+    expect("package_exports_resolve_username", hasattr(_pkg, "resolve_username"))
+    expect("package_exports_resolve_id", hasattr(_pkg, "resolve_id"))
+
+
 def main() -> int:
     print("== config tests ==")
     run_config_tests()
@@ -798,6 +1166,12 @@ def main() -> int:
     run_acl_tests()
     print("\n== admin gate tests ==")
     run_admin_gate_tests()
+    print("\n== user cache tests ==")
+    run_user_cache_tests()
+    print("\n== persona tests ==")
+    run_persona_tests()
+    print("\n== docs tests ==")
+    run_docs_tests()
     print("\n== repo grep tests ==")
     run_repo_grep_tests()
     print("\n== agent handler tests ==")

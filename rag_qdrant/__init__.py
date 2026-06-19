@@ -43,6 +43,7 @@ from .qdrant_store import (
     show_access,
 )
 from .text_processing import chunk_text, extract_text, normalize_text
+from .user_cache import record_seen, resolve_id, resolve_username
 
 __version__ = "0.1.0"
 
@@ -74,6 +75,9 @@ __all__ = [
     "ingest_text",
     "is_admin",
     "normalize_text",
+    "record_seen",
+    "resolve_id",
+    "resolve_username",
     "revoke_access",
     "search",
     "search_cache_clear",

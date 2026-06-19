@@ -873,10 +873,10 @@ def run_admin_tool_tests() -> None:
 
     # 1) Tool schema shape
     expect('admin_tools_is_list', isinstance(ADMIN_TOOLS, list))
-    expect('admin_tools_three_entries', len(ADMIN_TOOLS) == 3)
+    expect('admin_tools_four_entries', len(ADMIN_TOOLS) == 4)
     admin_names = sorted(t['function']['name'] for t in ADMIN_TOOLS)
-    expect('admin_tools_contains_grant_revoke_show',
-           admin_names == ['grant_access', 'revoke_access', 'show_access'])
+    expect('admin_tools_contains_grant_revoke_resolve_show',
+           admin_names == ['grant_access', 'resolve_username', 'revoke_access', 'show_access'])
 
     # TOOLS_WITH_ADMIN = base TOOLS + ADMIN_TOOLS
     expect('tools_with_admin_superset', len(TOOLS_WITH_ADMIN) == len(TOOLS) + len(ADMIN_TOOLS))
@@ -915,7 +915,7 @@ def run_admin_tool_tests() -> None:
         reply = handle_message(AgentMessage(text='let 123 see x', current_telegram_id=920567169))
     expect('admin_grant_calls_qdrant', m_grant.called)
     expect('admin_grant_calls_with_source', m_grant.call_args[0][0] == 'x')
-    expect('admin_grant_calls_with_id', m_grant.call_args[0][1] == '123')
+    expect('admin_grant_calls_with_id', m_grant.call_args[0][1] == 123)
     expect('admin_grant_reply_mentions_count', '2' in reply.text)
     expect('admin_grant_does_not_ingest', not m_text.called)
 
@@ -925,7 +925,7 @@ def run_admin_tool_tests() -> None:
         reply = handle_message(AgentMessage(text='remove 456 from y', current_telegram_id=920567169))
     expect('admin_revoke_calls_qdrant', m_revoke.called)
     expect('admin_revoke_calls_with_source', m_revoke.call_args[0][0] == 'y')
-    expect('admin_revoke_calls_with_id', m_revoke.call_args[0][1] == '456')
+    expect('admin_revoke_calls_with_id', m_revoke.call_args[0][1] == 456)
     expect('admin_revoke_reply_mentions_count', '1' in reply.text)
 
     # 6) Admin LLM call to show_access with existing chunks
@@ -1027,6 +1027,203 @@ def run_admin_tool_tests() -> None:
 
 
 # ---------------------------------------------------------------------------
+# User-cache + @username resolver integration (issue #7)
+# ---------------------------------------------------------------------------
+
+def _setup_user_cache(tmp_path: Path):
+    """Patch the user_cache module to write under ``tmp_path``.
+
+    Returns the user_cache module (already redirected).
+    """
+    import rag_qdrant.user_cache as uc
+    import rag_qdrant.agent_handler as handler_uc
+
+    real_cache_path = uc.cache_path
+
+    def _stub_cache_path() -> Path:
+        return tmp_path / "user_cache.json"
+
+    uc.cache_path = _stub_cache_path  # type: ignore[assignment]
+    handler_uc.user_cache_resolve_username = uc.resolve_username  # type: ignore[attr-defined]
+    handler_uc.user_cache_resolve_id = uc.resolve_id  # type: ignore[attr-defined]
+    handler_uc.record_seen = uc.record_seen  # type: ignore[attr-defined]
+    return uc
+
+
+def run_user_cache_integration_tests() -> None:
+    """Cover the auto-record_seen, resolve_username tool, and @username resolution
+    inside grant_access / revoke_access.
+
+    Each scenario points the user cache at a temp file so it stays isolated
+    from the on-disk one. The actual cache helper functions are reused
+    unchanged.
+    """
+    import rag_qdrant.user_cache as uc_module
+    from rag_qdrant.agent_handler import (
+        ADMIN_ONLY_MESSAGE as _ADM_MSG,
+        USERNAME_NOT_SEEN_MESSAGE as _UNSEEN,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        uc = _setup_user_cache(tmp_path)
+        # Clean any leftover file
+        try:
+            (tmp_path / "user_cache.json").unlink()
+        except OSError:
+            pass
+
+        # 1) Inbound message auto-records the sender
+        with _stub_classify(('chat', 'Mm.')) as m_classify, \
+             patch.object(handler_module, 'ingest_text') as m_text, \
+             patch.object(handler_module, 'ingest_photo') as m_photo:
+            handle_message(AgentMessage(
+                text='hi',
+                current_telegram_id=428765901,
+                current_username='alice',
+                current_first_name='Alice',
+            ))
+        expect('inbound_records_user_seen', uc.resolve_username('alice') == 428765901)
+        rec = uc.resolve_id(428765901)
+        expect('inbound_records_user_first_name', bool(rec) and rec.get('first_name') == 'Alice')
+
+        # 2) Inbound message without telegram_id does NOT record
+        with _stub_classify(('chat', 'Mm.')) as m_classify:
+            handle_message(AgentMessage(text='hi', current_username='ghost'))
+        expect('inbound_no_id_no_record', uc.resolve_username('ghost') is None)
+
+        # 3) resolve_username tool: hit returns telegram_id + first_name
+        with _stub_classify(('resolve_username', json.dumps({'username': 'alice'}))) as m_classify:
+            reply = handle_message(AgentMessage(
+                text='who is @alice?',
+                current_telegram_id=920567169,
+            ))
+        expect('resolve_username_hit_text', '428765901' in reply.text)
+        expect('resolve_username_hit_mentions_alice', '@alice' in reply.text.lower())
+        expect('resolve_username_hit_mentions_first_name', 'Alice' in reply.text)
+
+        # 4) resolve_username tool: miss returns USERNAME_NOT_SEEN_MESSAGE
+        with _stub_classify(('resolve_username', json.dumps({'username': 'ghost'}))) as m_classify:
+            reply = handle_message(AgentMessage(
+                text='who is @ghost?',
+                current_telegram_id=920567169,
+            ))
+        expect('resolve_username_miss_returns_unseen_msg', reply.text == _UNSEEN)
+
+        # 5) resolve_username tool: case-insensitive, with leading @
+        with _stub_classify(('resolve_username', json.dumps({'username': '@ALICE'}))) as m_classify:
+            reply = handle_message(AgentMessage(
+                text='who is @ALICE?',
+                current_telegram_id=920567169,
+            ))
+        expect('resolve_username_at_alice_hit', '428765901' in reply.text)
+
+        # 6) resolve_username is admin-only
+        with _stub_classify(('resolve_username', json.dumps({'username': 'alice'}))) as m_classify, \
+             patch.object(handler_module, 'user_cache_resolve_username', wraps=uc.resolve_username) as m_resolve:
+            reply = handle_message(AgentMessage(
+                text='who is @alice?',
+                current_telegram_id=999,
+            ))
+        expect('resolve_username_nonadmin_gated', _ADM_MSG in reply.text or 'only available to admins' in reply.text)
+        expect('resolve_username_nonadmin_no_resolve_call', not m_resolve.called)
+
+        # 7) grant_access with @username resolves and passes int id
+        with _stub_classify(('grant_access', json.dumps({'source': 'q3', 'telegram_id': '@alice'}))) as m_classify, \
+             patch.object(handler_module, 'qdrant_grant_access', return_value={'source': 'q3', 'telegram_id': '428765901', 'updated': 2}) as m_grant:
+            reply = handle_message(AgentMessage(
+                text='let @alice see q3',
+                current_telegram_id=920567169,
+            ))
+        expect('grant_at_username_calls_qdrant', m_grant.called)
+        expect('grant_at_username_passes_int_id', m_grant.call_args[0][1] == 428765901)
+        expect('grant_at_username_reply_ok', 'Granted' in reply.text)
+
+        # 8) grant_access with bare username (no @) also resolves
+        with _stub_classify(('grant_access', json.dumps({'source': 'q3', 'telegram_id': 'alice'}))) as m_classify, \
+             patch.object(handler_module, 'qdrant_grant_access', return_value={'source': 'q3', 'telegram_id': '428765901', 'updated': 1}) as m_grant:
+            reply = handle_message(AgentMessage(
+                text='let alice see q3',
+                current_telegram_id=920567169,
+            ))
+        expect('grant_bare_username_resolves', m_grant.call_args[0][1] == 428765901)
+
+        # 9) grant_access with numeric id (string) passes through normalized to int
+        with _stub_classify(('grant_access', json.dumps({'source': 'q3', 'telegram_id': '123'}))) as m_classify, \
+             patch.object(handler_module, 'qdrant_grant_access', return_value={'source': 'q3', 'telegram_id': '123', 'updated': 1}) as m_grant:
+            reply = handle_message(AgentMessage(
+                text='let 123 see q3',
+                current_telegram_id=920567169,
+            ))
+        expect('grant_numeric_string_id_normalized_to_int', m_grant.call_args[0][1] == 123)
+
+        # 10) grant_access with @ghost (unknown username) returns USERNAME_NOT_SEEN_MESSAGE, no qdrant write
+        with _stub_classify(('grant_access', json.dumps({'source': 'q3', 'telegram_id': '@ghost'}))) as m_classify, \
+             patch.object(handler_module, 'qdrant_grant_access') as m_grant:
+            reply = handle_message(AgentMessage(
+                text='let @ghost see q3',
+                current_telegram_id=920567169,
+            ))
+        expect('grant_unknown_username_unseen_msg', reply.text == _UNSEEN)
+        expect('grant_unknown_username_no_qdrant_write', not m_grant.called)
+
+        # 11) revoke_access with @username resolves
+        with _stub_classify(('revoke_access', json.dumps({'source': 'q3', 'telegram_id': '@alice'}))) as m_classify, \
+             patch.object(handler_module, 'qdrant_revoke_access', return_value={'source': 'q3', 'telegram_id': '428765901', 'updated': 1, 'removed': 1}) as m_revoke:
+            reply = handle_message(AgentMessage(
+                text='remove @alice from q3',
+                current_telegram_id=920567169,
+            ))
+        expect('revoke_at_username_calls_qdrant', m_revoke.called)
+        expect('revoke_at_username_passes_int_id', m_revoke.call_args[0][1] == 428765901)
+
+        # 12) Username change: alice -> alicia; old "alice" is dropped
+        with _stub_classify(('chat', 'Noted.')):
+            handle_message(AgentMessage(
+                text='hi',
+                current_telegram_id=428765901,
+                current_username='alicia',
+                current_first_name='Alicia',
+            ))
+        expect('inbound_username_change_records_new', uc.resolve_username('alicia') == 428765901)
+        expect('inbound_username_change_drops_old', uc.resolve_username('alice') is None)
+
+        # 13) AgentMessage exposes current_username / current_first_name
+        msg = AgentMessage(
+            text='hi', current_telegram_id=1,
+            current_username='bob', current_first_name='Bob',
+        )
+        expect('agent_message_has_current_username_field', msg.current_username == 'bob')
+        expect('agent_message_has_current_first_name_field', msg.current_first_name == 'Bob')
+        msg2 = AgentMessage(text='hi', current_telegram_id=1)
+        expect('agent_message_current_username_default_none', msg2.current_username is None)
+        expect('agent_message_current_first_name_default_none', msg2.current_first_name is None)
+
+        # 14) The new tool is in the admin schema but not the public schema
+        from rag_qdrant.prompts import ADMIN_TOOLS, TOOLS, TOOLS_WITH_ADMIN
+        admin_names = [t['function']['name'] for t in ADMIN_TOOLS]
+        expect('resolve_username_in_admin_tools', 'resolve_username' in admin_names)
+        public_names = [t['function']['name'] for t in TOOLS]
+        expect('resolve_username_not_in_public_tools', 'resolve_username' not in public_names)
+        expect('resolve_username_in_tools_with_admin', 'resolve_username' in [t['function']['name'] for t in TOOLS_WITH_ADMIN])
+
+        # 15) Malformed resolve_username payload → error
+        with _stub_classify(('resolve_username', '{not json')) as m_classify:
+            reply = handle_message(AgentMessage(text='who?', current_telegram_id=920567169))
+        expect('resolve_username_malformed_payload_error', 'malformed' in reply.text.lower())
+
+        # 16) Empty username in resolve_username payload → error
+        with _stub_classify(('resolve_username', json.dumps({'username': '   '}))) as m_classify:
+            reply = handle_message(AgentMessage(text='who?', current_telegram_id=920567169))
+        expect('resolve_username_empty_payload_error', 'requires' in reply.text.lower() or 'non-empty' in reply.text.lower())
+
+    # Restore the user_cache module to its original cache_path() implementation.
+    import importlib as _il
+    _il.reload(uc_module)
+    _il.reload(handler_module)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -1039,6 +1236,8 @@ def main() -> int:
     run_classify_and_route_tests()
     print('\n== admin tool tests ==')
     run_admin_tool_tests()
+    print('\n== user cache integration tests ==')
+    run_user_cache_integration_tests()
     print(f'\n{len(passed)} passed, {len(failed)} failed')
     if failed:
         for label, detail in failed:

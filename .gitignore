@@ -12,3 +12,4 @@ storage/models/
 .opencode/
 .venv-smoke/
 smoke_acl.py
+smoke_user_cache.py
